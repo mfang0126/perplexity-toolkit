@@ -1,7 +1,8 @@
 """Kimi WebBridge driver implementation."""
 
 import json
-import subprocess
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 
 from .base import BrowserDriver
@@ -19,16 +20,33 @@ class WebBridgeDriver(BrowserDriver):
         payload = {"action": action, "session": self.session}
         if args:
             payload["args"] = args
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST", self.url,
-             "-H", "Content-Type: application/json",
-             "-d", json.dumps(payload)],
-            capture_output=True, text=True, timeout=30,
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.url, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
         )
         try:
-            return json.loads(result.stdout)
-        except Exception:
-            return {"error": result.stdout}
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status != 200:
+                    return {
+                        "error": (
+                            f"WebBridge HTTP {resp.status} from {self.url}"
+                        )
+                    }
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"error": f"WebBridge HTTP {e.code} from {self.url}: {e.reason}"}
+        except urllib.error.URLError as e:
+            return {
+                "error": (
+                    f"WebBridge connection failed — is kimi-webbridge "
+                    f"running on {self.url}? ({e.reason})"
+                )
+            }
+        except TimeoutError as e:
+            return {"error": f"WebBridge request timed out: {e}"}
+        except Exception as e:
+            return {"error": f"WebBridge error: {e}"}
 
     def navigate(self, url: str, new_tab: bool = True,
                  group_title: str = "") -> dict:

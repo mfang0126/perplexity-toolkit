@@ -58,48 +58,84 @@ def run_batch(
     resume: bool = False,
     delay: Optional[float] = None,
 ) -> List[SearchResult]:
-    """Run batch search with optional resume and rate limiting."""
+    """Run batch search with optional resume and rate limiting.
+
+    Progress is always tracked in progress_file (if given): each query|||mode
+    is appended only AFTER a successful search, so any batch — not just ones
+    started with resume=True — can be resumed later. Failed searches are not
+    marked done and are retried on resume. Output JSON is rewritten
+    incrementally after every item so a mid-batch crash loses no completed work.
+    """
     cfg = config or get_config()
     batch_delay = delay or cfg.batch_delay
 
     done_set = set()
-    if resume and progress_file and os.path.exists(progress_file):
+    if progress_file and os.path.exists(progress_file):
         with open(progress_file) as f:
             done_set = {line.strip() for line in f if line.strip()}
 
     results = []
     total = len(queries)
     skipped = 0
+    invalid = 0
+    failed = 0
+
+    def write_output():
+        with open(output_file, "w") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
 
     for i, item in enumerate(queries):
-        query = item["query"]
+        query = item.get("query", "")
         mode = item.get("mode", "search")
 
-        if query in done_set:
+        if not query:
+            invalid += 1
+            print(f"[{i+1}/{total}] WARNING: empty query, skipping", file=sys.stderr)
+            continue
+
+        if mode not in MODE_FUNCTIONS:
+            invalid += 1
+            print(
+                f"[{i+1}/{total}] WARNING: unknown mode '{mode}' for query "
+                f"'{query[:60]}', skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        key = f"{query}|||{mode}"
+        if resume and key in done_set:
             skipped += 1
             continue
 
         print(f"[{i+1}/{total}] {mode}: {query[:60]}...", file=sys.stderr)
-        fn = MODE_FUNCTIONS.get(mode, search)
 
+        ok = False
         try:
-            result = fn(query, config=cfg)
+            result = MODE_FUNCTIONS[mode](query, config=cfg)
+            ok = True
         except Exception as e:
+            failed += 1
             result = {"error": str(e), "query": query, "mode": mode}
+            print(f"  ERROR [{mode} {query[:60]}]: {e}", file=sys.stderr)
 
         result["query"] = query
         result["searched_at"] = datetime.now().isoformat()
         results.append(result)
+        write_output()
 
-        if progress_file:
+        if ok and progress_file:
             with open(progress_file, "a") as f:
-                f.write(query + "\n")
+                f.write(key + "\n")
 
         if i < total - 1:
             time.sleep(batch_delay)
 
-    with open(output_file, "w") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    # Ensure the output file exists even if every item was skipped/invalid.
+    write_output()
 
-    print(f"\nDone: {len(results)} searched, {skipped} skipped → {output_file}", file=sys.stderr)
+    print(
+        f"\nDone: {len(results)} searched, {skipped} resumed-skipped, "
+        f"{invalid} invalid/empty skipped, {failed} failed → {output_file}",
+        file=sys.stderr,
+    )
     return results

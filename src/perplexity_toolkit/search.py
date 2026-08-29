@@ -16,7 +16,7 @@ from typing import Optional
 from .config import Config, get_config
 from .drivers.base import BrowserDriver
 from .drivers.webbridge import WebBridgeDriver
-from .utils import compact_json, find_textbox, find_menuitem, find_button
+from .utils import compact_json, find_textbox, find_menuitem, find_button, submit_query
 from .utils.antidetect import (
     human_delay, micro_delay,
     human_paste, human_click, human_scroll,
@@ -67,23 +67,13 @@ def _activate_mode(driver, mode_name: str) -> bool:
 
 
 def _submit_query(driver):
-    """Submit query with the three-event Enter combo."""
-    driver.evaluate("""(() => {
-        const el = document.querySelector("[contenteditable]");
-        if (!el) return "no input";
-        el.dispatchEvent(new InputEvent("beforeinput", {
-            inputType: "insertText", data: "\\n", bubbles: true, cancelable: true
-        }));
-        el.dispatchEvent(new KeyboardEvent("keydown", {
-            key: "Enter", code: "Enter", keyCode: 13, which: 13,
-            bubbles: true, cancelable: true
-        }));
-        el.dispatchEvent(new KeyboardEvent("keyup", {
-            key: "Enter", code: "Enter", keyCode: 13, which: 13,
-            bubbles: true, cancelable: true
-        }));
-        return "submitted";
-    })()""")
+    """Submit query with a trusted CDP Enter key.
+
+    Delegates to utils.submit_query: CDP Input.dispatchKeyEvent produces
+    isTrusted=true events (real-keyboard path, invisible to bot detection),
+    verifies the page started loading results, and retries once if not.
+    """
+    submit_query(driver)
 
 
 def _switch_to_tab(driver, tab_text: str):
