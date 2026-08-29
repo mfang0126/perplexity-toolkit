@@ -1,67 +1,120 @@
-# Perplexity Skill — 浏览器自动化 + 问题全景
+# Perplexity Toolkit
 
-## 目标
+Automate Perplexity AI search via browser control — search, extract, batch, and analyze.
 
-榨干 Perplexity AI：通过浏览器自动化完整控制 Perplexity 搜索流程，同时建立已知问题全景数据库。
+## What It Does
 
-## 项目结构
+- **4 search modes**: Standard, Deep Research, Model Council, Step-by-step Learning
+- **Batch pipeline**: Search hundreds of queries with resume and rate limiting
+- **Result aggregation**: Dedup sources, rank by frequency, generate reports
+- **Source extraction**: Get all cited URLs with titles and snippets
+- **Follow-up capture**: Extract Perplexity's suggested follow-up questions
+
+## Quick Start
+
+```bash
+# Install
+pip install -e .
+
+# Single search
+perplexity search "best AI coding agents 2026"
+
+# Deep Research (multi-step, 60-120s)
+perplexity search "AI safety risks 2026" -m deep_research
+
+# Batch from file
+perplexity batch -i queries.json -o results.json
+
+# Aggregate results
+perplexity aggregate results.json -f markdown
+```
+
+## Python API
+
+```python
+from perplexity_toolkit.search import search, deep_research, model_council
+
+# Standard search
+result = search("Python vs Rust 2026")
+print(result["answer"])      # Full answer text
+print(result["sources"])     # [{text, href}, ...]
+print(result["follow_ups"])  # ["follow-up question", ...]
+
+# Deep Research (longer, more detailed)
+result = deep_research("AI agent frameworks comparison")
+
+# Model Council (multiple models answer)
+result = model_council("best programming language for beginners")
+```
+
+## Batch Pipeline
+
+```python
+from perplexity_toolkit.batch import run_batch
+
+queries = [
+    {"query": "topic 1", "mode": "search"},
+    {"query": "topic 2", "mode": "deep_research"},
+]
+results = run_batch(queries, output_file="results.json", delay=5.0)
+```
+
+## Architecture
 
 ```
-perplexity-skill/
-├── src/                          # 代码
-│   └── perplexity_search.py      # 核心搜索脚本（已验证）
-├── docs/                         # 开发文档
-│   ├── SKILL.md                  # Hermes Skill 定义
-│   ├── perplexity-browser-mapping.md   # 浏览器交互测绘
-│   ├── perplexity-reddit-issues.md     # Reddit 问题汇总
-│   ├── perplexity-twitter-community-issues.md  # X/社区问题
-│   └── perplexity-capability-analysis.md       # Web vs API 能力差距
-├── tests/                        # 测试
-├── scripts/                      # 辅助脚本
-└── README.md
+perplexity_toolkit/
+├── __init__.py          # Package init
+├── config.py            # Configuration management
+├── search.py            # Core search functions (4 modes)
+├── batch.py             # Batch pipeline with resume
+├── aggregator.py        # Result aggregation + reports
+├── drivers/             # Browser driver abstraction
+│   ├── base.py          # Abstract BrowserDriver interface
+│   └── webbridge.py     # Kimi WebBridge implementation
+├── utils/               # DOM parsing + event helpers
+│   └── __init__.py
+└── commands/            # CLI
+    └── cli.py
 ```
 
-## 已验证的自动化流程
+## Browser Driver
 
-1. **navigate** → perplexity.ai
-2. **snapshot** → 获取 textbox @e ref
-3. **click** textbox → 聚焦（必须先点击）
-4. **fill** textbox → 写入查询
-5. **三事件 Enter** → beforeinput + keydown + keyup
-6. **wait** 10-15s → 等待答案生成
-7. **"查看更多"** → 展开折叠答案
-8. **extract** → 提取答案文本 + 源链接 + 后续问题
+The toolkit uses an abstract `BrowserDriver` interface. Current implementation:
 
-## 关键发现
+- **WebBridgeDriver** — Kimi WebBridge (Chrome extension + local daemon)
 
-| 问题 | 解决方案 |
-|------|---------|
-| fill 不生效 | 必须先 click textbox 再 fill |
-| Enter 不触发搜索 | 需要 beforeinput + keydown + keyup 三事件 |
-| 答案被截断 | 点击"查看更多"按钮展开 |
-| @e ref 每次不同 | 用 snapshot + regex 动态查找 |
-| snapshot JSON 有空格 | 用 `separators=(",",":")` 压缩 |
+To add a new backend (Playwright, Selenium, etc.), implement `BrowserDriver` in `drivers/`:
 
-## 核心研究发现
+```python
+from perplexity_toolkit.drivers.base import BrowserDriver
 
-### API vs Web 差距（最重要）
-- Web UI 和 API 是**故意设计成不同产品**
-- 官方明确表示**不打算让 API 输出质量匹配 UI**
-- Web-only 功能：Pro Search、Collections/Spaces、Focus 模式、图片生成、Model Council、400+ 连接器
-- 这是浏览器自动化的核心价值
+class PlaywrightDriver(BrowserDriver):
+    def navigate(self, url, new_tab=True, group_title=""): ...
+    def snapshot(self): ...
+    def click(self, selector): ...
+    def fill(self, selector, value): ...
+    def evaluate(self, code): ...
+    def screenshot(self, path=None): ...
+    def close(self): ...
+```
 
-### 已知问题 Top 5
-1. **搜索幻觉** — 37% 引用错误率（8 个 AI 搜索工具中最好，但仍超 1/3）
-2. **长文/代码/推理弱** — 不如原生 GPT/Claude/Gemini 应用
-3. **记忆薄/线程断** — 不是可搜索的知识库
-4. **配额不透明** — Pro/Max 限制是"平均使用"而非硬数字
-5. **搜索绑定** — 不是完整工作区
+## Requirements
 
-## 下一步
+- Python 3.9+
+- Kimi WebBridge daemon (`~/.kimi-webbridge/bin/kimi-webbridge start`)
+- Chrome with Kimi WebBridge extension installed
+- Perplexity account (free or Pro)
 
-- [ ] Deep Research 模式自动化
-- [ ] Focus 模式切换（Academic/Writing/Math）
-- [ ] 批量搜索管线
-- [ ] 结果聚合 + 去重
-- [ ] 文件上传流程
-- [ ] 模型切换自动化
+## Known Limitations
+
+- Deep Research mode leaks a "/" prefix in the query (Perplexity handles it gracefully)
+- Model selector dropdown requires CDP-level clicks (not yet automated)
+- File upload flow not yet mapped
+
+## Research
+
+See `docs/research/` for comprehensive analysis of Perplexity's known issues, API vs web gap, and browser automation mapping.
+
+## License
+
+MIT
