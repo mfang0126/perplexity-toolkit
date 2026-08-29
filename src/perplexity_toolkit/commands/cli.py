@@ -1,6 +1,7 @@
 """CLI entry point for perplexity-toolkit."""
 
 import argparse
+import logging
 import json
 import sys
 
@@ -59,6 +60,10 @@ def main():
         prog="perplexity",
         description="Perplexity Toolkit — automate Perplexity AI search",
     )
+    parser.add_argument("-w", "--wait", type=float, help="Search wait time (seconds)")
+    parser.add_argument("-r", "--retries", type=int, help="Max retries")
+    parser.add_argument("-b", "--backend", help="Driver backend (webbridge, playwright)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     sub = parser.add_subparsers(dest="command")
 
     # search
@@ -84,6 +89,21 @@ def main():
     p.add_argument("-f", "--format", default="json", choices=["json", "markdown"])
 
     args = parser.parse_args()
+    # Apply global config overrides
+    cfg_overrides = {}
+    if args.wait is not None:
+        cfg_overrides["search_wait"] = args.wait
+    if args.retries is not None:
+        cfg_overrides["max_retries"] = args.retries
+    if args.backend:
+        cfg_overrides["driver_backend"] = args.backend
+    if cfg_overrides:
+        set_config(**cfg_overrides)
+
+    # Setup logging
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(name)s %(levelname)s: %(message)s")
+
     if args.command == "search":
         cmd_search(args)
     elif args.command == "batch":

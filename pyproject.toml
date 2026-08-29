@@ -31,3 +31,6 @@ dev = ["pytest>=7.0", "pytest-cov"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

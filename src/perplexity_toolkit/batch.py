@@ -2,7 +2,7 @@
 
 import json
 import csv
-import sys
+import logging
 import os
 import time
 from typing import Optional, List
@@ -18,6 +18,8 @@ MODE_FUNCTIONS = {
     "model_council": model_council,
     "step_by_step": step_by_step,
 }
+
+logger = logging.getLogger(__name__)
 
 
 def load_queries(source: str) -> List[dict]:
@@ -73,12 +75,17 @@ def run_batch(
     if progress_file and os.path.exists(progress_file):
         with open(progress_file) as f:
             done_set = {line.strip() for line in f if line.strip()}
+        logger.debug("Resume: loaded %d completed keys from %s", len(done_set), progress_file)
 
     results = []
     total = len(queries)
     skipped = 0
     invalid = 0
     failed = 0
+    logger.info(
+        "Batch start: %d queries, output=%s, resume=%s, delay=%.1fs",
+        total, output_file, resume, batch_delay,
+    )
 
     def write_output():
         with open(output_file, "w") as f:
@@ -90,24 +97,24 @@ def run_batch(
 
         if not query:
             invalid += 1
-            print(f"[{i+1}/{total}] WARNING: empty query, skipping", file=sys.stderr)
+            logger.warning("[%d/%d] empty query, skipping", i + 1, total)
             continue
 
         if mode not in MODE_FUNCTIONS:
             invalid += 1
-            print(
-                f"[{i+1}/{total}] WARNING: unknown mode '{mode}' for query "
-                f"'{query[:60]}', skipping",
-                file=sys.stderr,
+            logger.warning(
+                "[%d/%d] unknown mode %r for query %r, skipping",
+                i + 1, total, mode, query[:60],
             )
             continue
 
         key = f"{query}|||{mode}"
         if resume and key in done_set:
             skipped += 1
+            logger.debug("[%d/%d] already done (resume), skipping: %s", i + 1, total, key)
             continue
 
-        print(f"[{i+1}/{total}] {mode}: {query[:60]}...", file=sys.stderr)
+        logger.info("[%d/%d] %s: %s", i + 1, total, mode, query[:80])
 
         ok = False
         try:
@@ -116,10 +123,17 @@ def run_batch(
         except Exception as e:
             failed += 1
             result = {"error": str(e), "query": query, "mode": mode}
-            print(f"  ERROR [{mode} {query[:60]}]: {e}", file=sys.stderr)
+            logger.error("[%d/%d] %s failed: %s", i + 1, total, mode, e)
 
         result["query"] = query
         result["searched_at"] = datetime.now().isoformat()
+        logger.debug(
+            "[%d/%d] %s: answer_len=%d sources=%d%s",
+            i + 1, total, mode,
+            len(result.get("answer") or ""),
+            len(result.get("sources") or []),
+            " (failed)" if not ok else "",
+        )
         results.append(result)
         write_output()
 
@@ -133,9 +147,8 @@ def run_batch(
     # Ensure the output file exists even if every item was skipped/invalid.
     write_output()
 
-    print(
-        f"\nDone: {len(results)} searched, {skipped} resumed-skipped, "
-        f"{invalid} invalid/empty skipped, {failed} failed → {output_file}",
-        file=sys.stderr,
+    logger.info(
+        "Batch done: %d searched, %d resumed-skipped, %d invalid/empty skipped, %d failed -> %s",
+        len(results), skipped, invalid, failed, output_file,
     )
     return results

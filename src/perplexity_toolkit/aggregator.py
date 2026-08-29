@@ -1,9 +1,12 @@
 """Result aggregation — dedup sources, rank by frequency, generate reports."""
 
 import json
+import logging
 from collections import Counter
 from typing import List
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 def aggregate(results: List[dict]) -> dict:
@@ -17,6 +20,8 @@ def aggregate(results: List[dict]) -> dict:
     modes = Counter(r.get("mode", "search") for r in results)
     errors = [r for r in results if r.get("error")]
 
+    logger.info("Aggregated: %d searches, %d errors, %d unique sources",
+                len(results), len(errors), len(sources))
     return {
         "total_searches": len(results),
         "successful": len(results) - len(errors),

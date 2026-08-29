@@ -1,36 +1,54 @@
 """Core Perplexity search functions with anti-detection.
 
-Each function returns a SearchResult dict with:
-    answer: str — full answer text
-    sources: list[dict] — {text, href} source links
-    url: str — Perplexity search URL
-    title: str — page title
-    follow_ups: list[str] — suggested follow-up questions
-    mode: str — which search mode was used
+All modes share one pipeline (_search_core) parameterized by MODES config.
 """
 
+import logging
 import random
 import time
-from typing import Optional
+from typing import Optional, TypedDict, List
 
 from .config import Config, get_config
 from .drivers.base import BrowserDriver
-from .drivers.webbridge import WebBridgeDriver
-from .utils import compact_json, find_textbox, find_menuitem, find_button, submit_query
+from .drivers import create_driver
+from .utils import compact_json, find_textbox, find_menuitem, submit_query
 from .utils.antidetect import (
     human_delay, micro_delay,
-    human_paste, human_click, human_scroll,
+    human_paste, human_scroll,
     combined_snapshot_and_info, combined_extract,
 )
+from .utils.i18n import get_ui_string
 
-SearchResult = dict
+logger = logging.getLogger(__name__)
 
+
+# ──────────────────────────────────────────────
+# Type definitions
+# ──────────────────────────────────────────────
+
+class Source(TypedDict):
+    text: str
+    href: str
+
+
+class SearchResult(TypedDict, total=False):
+    answer: Optional[str]
+    sources: List[Source]
+    url: str
+    title: str
+    follow_ups: List[str]
+    mode: str
+    query: str
+    error: str
+    searched_at: str
+
+
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
 
 def _make_driver(config: Config, suffix: str) -> BrowserDriver:
-    return WebBridgeDriver(
-        url=config.webbridge_url,
-        session=config.make_session(suffix),
-    )
+    return create_driver(config, suffix)
 
 
 def _snapshot_compact(driver) -> str:
@@ -43,37 +61,42 @@ def _find_and_click_textbox(driver, s: str) -> Optional[str]:
     """Find textbox and click it with human-like timing."""
     ref = find_textbox(s)
     if ref:
-        # Simulate human: brief pause before clicking
         micro_delay(0.1, 0.3)
         driver.click(ref)
         human_delay(0.3, 0.6)
+        logger.debug("Textbox found: %s", ref)
+    else:
+        logger.debug("Textbox not found in snapshot")
     return ref
 
 
 def _activate_mode(driver, mode_name: str) -> bool:
     """Activate a search mode via '/' menu with human timing."""
-    # Type "/" — use CDP insertText (single char, no need for per-char typing)
     driver.cdp("Input.insertText", {"text": "/"})
-    human_delay(0.8, 1.3)  # Wait for menu to appear (human reaction time)
+    human_delay(0.8, 1.3)
 
     s = _snapshot_compact(driver)
     ref = find_menuitem(s, mode_name)
     if not ref:
+        logger.debug("Mode menu item %r not found", mode_name)
         return False
 
     driver.click(ref)
-    human_delay(0.8, 1.2)  # Wait for mode to activate
+    human_delay(0.8, 1.2)
+    logger.debug("Activated mode %r via menuitem %s", mode_name, ref)
     return True
 
 
-def _submit_query(driver):
-    """Submit query with a trusted CDP Enter key.
-
-    Delegates to utils.submit_query: CDP Input.dispatchKeyEvent produces
-    isTrusted=true events (real-keyboard path, invisible to bot detection),
-    verifies the page started loading results, and retries once if not.
-    """
-    submit_query(driver)
+def _submit_query(driver) -> str:
+    """Submit query with trusted CDP Enter key."""
+    status = submit_query(driver)
+    if status == "submitted":
+        logger.info("Query submitted")
+    elif status == "submitted_retry":
+        logger.info("Query submitted after retry")
+    else:
+        logger.warning("No submit detected")
+    return status
 
 
 def _switch_to_tab(driver, tab_text: str):
@@ -87,100 +110,205 @@ def _switch_to_tab(driver, tab_text: str):
 
 
 def _is_search_done(driver) -> bool:
-    """Check if search completed using consolidated JS."""
-    info = combined_snapshot_and_info(driver)
-    return info.get("done", False)
+    return combined_snapshot_and_info(driver).get("done", False)
 
 
-def _expand_answer(driver) -> bool:
-    """Click '查看更多' to expand collapsed answer."""
-    result = driver.evaluate("""(() => {
+def _expand_answer(driver, locale: str = "zh") -> bool:
+    """Click expand button to show full answer."""
+    show_more = get_ui_string("show_more", locale)
+    result = driver.evaluate(f"""(() => {{
         const btns = Array.from(document.querySelectorAll("button"));
-        const more = btns.find(b => b.innerText.includes("查看更多"));
-        if (more) { more.click(); return "expanded"; }
+        const more = btns.find(b => b.innerText.includes("{show_more}"));
+        if (more) {{ more.click(); return "expanded"; }}
         return "no expand";
-    })()""")
+    }})()""")
     if result == "expanded":
+        logger.debug("Answer expanded")
         human_delay(0.5, 1.0)
         return True
     return False
 
 
-def _extract_results(driver) -> dict:
+def _extract_results(driver, locale: str = "zh") -> dict:
     """Extract answer, sources, and follow-ups in one consolidated call."""
-    # First switch to Links tab to load source data
-    _switch_to_tab(driver, "链接")
+    sources_tab = get_ui_string("sources_tab", locale)
+    answer_tab = get_ui_string("answer_tab", locale)
+    _switch_to_tab(driver, sources_tab)
     human_delay(0.3, 0.6)
-
-    # Extract everything in ONE evaluate call
     data = combined_extract(driver)
-
-    # Switch back to answer tab
-    _switch_to_tab(driver, "答案")
+    _switch_to_tab(driver, answer_tab)
     human_delay(0.2, 0.4)
-
     return data
 
 
+def _log_completion(mode: str, query: str, data: dict, info: dict) -> None:
+    answer = data.get("answer", "")
+    sources = data.get("sources", [])
+    if not answer:
+        logger.warning("%s: empty answer for %r", mode, query[:80])
+    if not sources:
+        logger.warning("%s: no sources for %r", mode, query[:80])
+    logger.info("%s done: answer_len=%d sources=%d url=%s",
+                mode, len(answer), len(sources), info.get("url", ""))
+
+
+def _error_result(mode: str, message: str) -> SearchResult:
+    return {"error": message, "answer": None, "sources": [],
+            "url": "", "title": "", "follow_ups": [], "mode": mode}
+
+
 # ──────────────────────────────────────────────
-# Public search functions
+# Retry with exponential backoff
 # ──────────────────────────────────────────────
 
-def search(
-    query: str,
-    config: Optional[Config] = None,
+_RATE_LIMIT_PHRASES = ("limit reached", "too many requests", "rate limit")
+
+
+def _search_with_retry(
+    query: str, mode: str, config: Config,
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
-    expand: bool = True,
-    new_tab: bool = True,
+    expand: Optional[bool] = None, new_tab: bool = True,
 ) -> SearchResult:
-    """Standard Perplexity search with anti-detection.
+    """Run _search_core with retry + exponential backoff."""
+    max_retries = config.max_retries
+    best_result: SearchResult = _error_result(mode, "no attempts")
 
-    Args:
-        query: Search query string.
-        config: Configuration (uses default if None).
-        driver: Browser driver (creates WebBridge if None).
-        wait_seconds: Wait time for results (default from config).
-        expand: Whether to expand collapsed answers.
-        new_tab: Whether to open in a new browser tab.
-    """
-    cfg = config or get_config()
-    drv = driver or _make_driver(cfg, "search")
-    wait = wait_seconds or cfg.search_wait
+    for attempt in range(max_retries + 1):
+        try:
+            result = _search_core_once(
+                query, mode, config, driver, wait_seconds, expand, new_tab
+            )
+        except Exception as e:
+            logger.error("%s attempt %d exception: %s", mode, attempt + 1, e)
+            result = _error_result(mode, str(e))
 
-    # 1. Navigate — human pause before starting
+        best_result = result
+
+        # Check if retry needed
+        if result.get("error"):
+            reason = "error"
+        elif not result.get("answer") and not result.get("sources"):
+            reason = "empty"
+        elif any(p in (result.get("answer") or "").lower() for p in _RATE_LIMIT_PHRASES):
+            reason = "rate_limit"
+        else:
+            break  # Success
+
+        if attempt < max_retries:
+            if reason == "rate_limit":
+                wait = 10 * (2 ** attempt) + random.uniform(0, 2)
+            else:
+                wait = 2 * (2 ** attempt) + random.uniform(0, 1)
+            logger.warning("%s retry %d/%d (%s), backoff %.1fs",
+                           mode, attempt + 1, max_retries, reason, wait)
+            time.sleep(wait)
+        else:
+            logger.error("%s exhausted %d retries (%s)", mode, max_retries, reason)
+
+    return best_result
+
+
+# ──────────────────────────────────────────────
+# Mode configuration
+# ──────────────────────────────────────────────
+
+_BASE_MODE = {
+    "wait": "search_wait", "mode_name": None, "label": "",
+    "poll": False, "scroll": False, "scroll_amount": 2, "scroll_delay": 0.4,
+    "expand": False, "session": "search", "group": "",
+}
+
+MODES = {
+    "search": {**_BASE_MODE,
+               "label": "Search", "scroll": True, "expand": True, "group": "Search"},
+    "deep_research": {**_BASE_MODE, "wait": "deep_research_wait",
+                      "mode_name": "deep_research",
+                      "label": "Deep Research", "poll": True, "scroll": True,
+                      "scroll_amount": 3, "scroll_delay": 0.5,
+                      "session": "deep-research", "group": "DR"},
+    "model_council": {**_BASE_MODE, "wait": "model_council_wait",
+                      "mode_name": "model_council",
+                      "label": "Model Council", "session": "council", "group": "Council"},
+    "step_by_step": {**_BASE_MODE, "wait": "step_by_step_wait",
+                     "mode_name": "step_by_step",
+                     "label": "Step-by-step", "session": "stepbystep", "group": "SbS"},
+}
+
+
+# ──────────────────────────────────────────────
+# Core pipeline (single attempt)
+# ──────────────────────────────────────────────
+
+def _search_core_once(
+    query: str, mode: str, config: Config,
+    driver: Optional[BrowserDriver] = None,
+    wait_seconds: Optional[float] = None,
+    expand: Optional[bool] = None, new_tab: bool = True,
+) -> SearchResult:
+    """One attempt of the Perplexity pipeline for a given mode."""
+    m = MODES[mode]
+    cfg = config
+    drv = driver or _make_driver(cfg, m["session"])
+    wait = wait_seconds or getattr(cfg, m["wait"])
+    locale = cfg.locale
+    if expand is None:
+        expand = m["expand"]
+
+    logger.info("Search start: mode=%s query=%r wait=%.1fs", mode, query[:80], wait)
+
+    # Navigate
     human_delay(0.5, 1.5)
-    drv.navigate(cfg.base_url, new_tab=new_tab, group_title=f"Search: {query[:50]}")
+    drv.navigate(cfg.base_url, new_tab=new_tab,
+                 group_title=f"{m['group']}: {query[:50]}")
     time.sleep(cfg.page_load_wait)
 
-    # 2. Find and click textbox
+    # Find textbox
     s = _snapshot_compact(drv)
     ref = _find_and_click_textbox(drv, s)
     if not ref:
-        return {"error": "Could not find textbox", "answer": None, "sources": [],
-                "url": "", "title": "", "follow_ups": [], "mode": "search"}
+        logger.warning("%s aborted: no textbox", mode)
+        return _error_result(mode, "Could not find textbox")
 
-    # 3. Type query with human-like input
+    # Activate mode via '/' menu
+    if m["mode_name"]:
+        display_name = get_ui_string(m["mode_name"], locale)
+        if not _activate_mode(drv, display_name):
+            logger.warning("%s aborted: mode %r not found", mode, display_name)
+            return _error_result(mode, f"Could not activate {m['label']}")
+
+    # Type + submit
+    human_delay(0.3, 0.6)
     human_paste(drv, query, chunk_size=6, delay=0.06)
-    human_delay(0.3, 0.8)  # Think before pressing Enter
-
-    # 4. Submit
+    human_delay(0.3, 0.8)
     _submit_query(drv)
 
-    # 5. Wait for results — randomized check interval
-    time.sleep(wait)
+    # Wait
+    if m["poll"]:
+        elapsed = 0
+        while elapsed < wait:
+            sleep_time = random.uniform(12, 18)
+            time.sleep(sleep_time)
+            elapsed += sleep_time
+            if _is_search_done(drv):
+                logger.debug("%s finished after %.0fs", mode, elapsed)
+                break
+        else:
+            logger.debug("%s wait elapsed %.0fs", mode, elapsed)
+    else:
+        time.sleep(wait)
 
-    # 6. Scroll down a bit (like a human reading), then expand
-    human_scroll(drv, "down", amount=2, delay=0.4)
+    # Scroll + expand
+    if m["scroll"]:
+        human_scroll(drv, "down", amount=m["scroll_amount"], delay=m["scroll_delay"])
     if expand:
-        _expand_answer(drv)
+        _expand_answer(drv, locale)
         human_delay(0.5, 1.0)
 
-    # 7. Extract results (consolidated JS)
-    data = _extract_results(drv)
-
-    # 8. Get page URL/title (consolidated)
+    # Extract
+    data = _extract_results(drv, locale)
     info = combined_snapshot_and_info(drv)
+    _log_completion(mode, query, data, info)
 
     return {
         "answer": data.get("answer", ""),
@@ -188,152 +316,45 @@ def search(
         "url": info.get("url", ""),
         "title": info.get("title", ""),
         "follow_ups": data.get("follow_ups", []),
-        "mode": "search",
+        "mode": mode,
     }
 
 
-def deep_research(
-    query: str,
-    config: Optional[Config] = None,
+def _search_core(
+    query: str, mode: str, config: Optional[Config] = None,
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
-    new_tab: bool = True,
+    expand: Optional[bool] = None, new_tab: bool = True,
 ) -> SearchResult:
+    """Run the Perplexity pipeline with retry."""
+    cfg = config or get_config()
+    return _search_with_retry(query, mode, cfg, driver, wait_seconds, expand, new_tab)
+
+
+# ──────────────────────────────────────────────
+# Public search functions (thin wrappers)
+# ──────────────────────────────────────────────
+
+def search(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
+           wait_seconds: Optional[float] = None, expand: bool = True,
+           new_tab: bool = True) -> SearchResult:
+    """Standard Perplexity search with anti-detection."""
+    return _search_core(query, "search", config, driver, wait_seconds, expand, new_tab)
+
+
+def deep_research(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
+                  wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
     """Deep Research mode — multi-step, longer answers, 60-120s."""
-    cfg = config or get_config()
-    drv = driver or _make_driver(cfg, "deep-research")
-    wait = wait_seconds or cfg.deep_research_wait
-
-    human_delay(0.5, 1.5)
-    drv.navigate(cfg.base_url, new_tab=new_tab, group_title=f"DR: {query[:50]}")
-    time.sleep(cfg.page_load_wait)
-
-    s = _snapshot_compact(drv)
-    ref = _find_and_click_textbox(drv, s)
-    if not ref:
-        return {"error": "Could not find textbox", "answer": None, "sources": [],
-                "url": "", "title": "", "follow_ups": [], "mode": "deep_research"}
-
-    if not _activate_mode(drv, "深度研究"):
-        return {"error": "Could not activate Deep Research", "answer": None,
-                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "deep_research"}
-
-    # Type query after mode activation
-    human_delay(0.3, 0.6)
-    human_paste(drv, query, chunk_size=6, delay=0.06)
-    human_delay(0.3, 0.8)
-    _submit_query(drv)
-
-    # Wait with periodic checks
-    elapsed = 0
-    while elapsed < wait:
-        sleep_time = random.uniform(12, 18)
-        time.sleep(sleep_time)
-        elapsed += sleep_time
-        if _is_search_done(drv):
-            break
-
-    # Scroll to read results
-    human_scroll(drv, "down", amount=3, delay=0.5)
-
-    data = _extract_results(drv)
-    info = combined_snapshot_and_info(drv)
-
-    return {
-        "answer": data.get("answer", ""),
-        "sources": data.get("sources", []),
-        "url": info.get("url", ""),
-        "title": info.get("title", ""),
-        "follow_ups": data.get("follow_ups", []),
-        "mode": "deep_research",
-    }
+    return _search_core(query, "deep_research", config, driver, wait_seconds, None, new_tab)
 
 
-def model_council(
-    query: str,
-    config: Optional[Config] = None,
-    driver: Optional[BrowserDriver] = None,
-    wait_seconds: Optional[float] = None,
-    new_tab: bool = True,
-) -> SearchResult:
+def model_council(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
+                  wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
     """Model Council mode — multiple models answer the same question."""
-    cfg = config or get_config()
-    drv = driver or _make_driver(cfg, "council")
-    wait = wait_seconds or cfg.model_council_wait
-
-    human_delay(0.5, 1.5)
-    drv.navigate(cfg.base_url, new_tab=new_tab, group_title=f"Council: {query[:50]}")
-    time.sleep(cfg.page_load_wait)
-
-    s = _snapshot_compact(drv)
-    ref = _find_and_click_textbox(drv, s)
-    if not ref:
-        return {"error": "Could not find textbox", "answer": None, "sources": [],
-                "url": "", "title": "", "follow_ups": [], "mode": "model_council"}
-
-    if not _activate_mode(drv, "模型委员会"):
-        return {"error": "Could not activate Model Council", "answer": None,
-                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "model_council"}
-
-    human_delay(0.3, 0.6)
-    human_paste(drv, query, chunk_size=6, delay=0.06)
-    human_delay(0.3, 0.8)
-    _submit_query(drv)
-    time.sleep(wait)
-
-    data = _extract_results(drv)
-    info = combined_snapshot_and_info(drv)
-
-    return {
-        "answer": data.get("answer", ""),
-        "sources": data.get("sources", []),
-        "url": info.get("url", ""),
-        "title": info.get("title", ""),
-        "follow_ups": data.get("follow_ups", []),
-        "mode": "model_council",
-    }
+    return _search_core(query, "model_council", config, driver, wait_seconds, None, new_tab)
 
 
-def step_by_step(
-    query: str,
-    config: Optional[Config] = None,
-    driver: Optional[BrowserDriver] = None,
-    wait_seconds: Optional[float] = None,
-    new_tab: bool = True,
-) -> SearchResult:
+def step_by_step(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
+                 wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
     """Step-by-step Learning mode — guided, structured answers."""
-    cfg = config or get_config()
-    drv = driver or _make_driver(cfg, "stepbystep")
-    wait = wait_seconds or cfg.step_by_step_wait
-
-    human_delay(0.5, 1.5)
-    drv.navigate(cfg.base_url, new_tab=new_tab, group_title=f"SbS: {query[:50]}")
-    time.sleep(cfg.page_load_wait)
-
-    s = _snapshot_compact(drv)
-    ref = _find_and_click_textbox(drv, s)
-    if not ref:
-        return {"error": "Could not find textbox", "answer": None, "sources": [],
-                "url": "", "title": "", "follow_ups": [], "mode": "step_by_step"}
-
-    if not _activate_mode(drv, "逐步学习"):
-        return {"error": "Could not activate Step-by-step", "answer": None,
-                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "step_by_step"}
-
-    human_delay(0.3, 0.6)
-    human_paste(drv, query, chunk_size=6, delay=0.06)
-    human_delay(0.3, 0.8)
-    _submit_query(drv)
-    time.sleep(wait)
-
-    data = _extract_results(drv)
-    info = combined_snapshot_and_info(drv)
-
-    return {
-        "answer": data.get("answer", ""),
-        "sources": data.get("sources", []),
-        "url": info.get("url", ""),
-        "title": info.get("title", ""),
-        "follow_ups": data.get("follow_ups", []),
-        "mode": "step_by_step",
-    }
+    return _search_core(query, "step_by_step", config, driver, wait_seconds, None, new_tab)

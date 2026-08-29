@@ -1,11 +1,20 @@
 """Kimi WebBridge driver implementation."""
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from typing import Any, Optional
 
 from .base import BrowserDriver
+
+
+logger = logging.getLogger(__name__)
+
+
+def _truncate(value, limit: int = 300) -> str:
+    s = str(value)
+    return s if len(s) <= limit else s[:limit] + "..."
 
 
 class WebBridgeDriver(BrowserDriver):
@@ -21,6 +30,8 @@ class WebBridgeDriver(BrowserDriver):
         if args:
             payload["args"] = args
         data = json.dumps(payload).encode("utf-8")
+        logger.debug("WebBridge -> %s action=%s session=%s args=%s",
+                     self.url, action, self.session, _truncate(args))
         req = urllib.request.Request(
             self.url, data=data,
             headers={"Content-Type": "application/json"}, method="POST",
@@ -28,15 +39,30 @@ class WebBridgeDriver(BrowserDriver):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status != 200:
+                    logger.error("WebBridge HTTP %s from %s (action=%s)",
+                                 resp.status, self.url, action)
                     return {
                         "error": (
                             f"WebBridge HTTP {resp.status} from {self.url}"
                         )
                     }
-                return json.loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("error"):
+                    logger.warning("WebBridge action=%s returned error: %s",
+                                   action, data["error"])
+                else:
+                    logger.debug("WebBridge <- action=%s ok", action)
+                return data
         except urllib.error.HTTPError as e:
+            logger.error("WebBridge HTTP %s from %s (action=%s): %s",
+                         e.code, self.url, action, e.reason)
             return {"error": f"WebBridge HTTP {e.code} from {self.url}: {e.reason}"}
         except urllib.error.URLError as e:
+            logger.error(
+                "WebBridge connection failed (action=%s) — is kimi-webbridge "
+                "running on %s? (%s)",
+                action, self.url, e.reason,
+            )
             return {
                 "error": (
                     f"WebBridge connection failed — is kimi-webbridge "
@@ -44,8 +70,14 @@ class WebBridgeDriver(BrowserDriver):
                 )
             }
         except TimeoutError as e:
+            logger.error(
+                "WebBridge request timed out (action=%s) on %s — check the "
+                "daemon and increase the request timeout if needed: %s",
+                action, self.url, e,
+            )
             return {"error": f"WebBridge request timed out: {e}"}
         except Exception as e:
+            logger.error("WebBridge unexpected error (action=%s): %s", action, e)
             return {"error": f"WebBridge error: {e}"}
 
     def navigate(self, url: str, new_tab: bool = True,
