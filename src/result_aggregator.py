@@ -72,13 +72,14 @@ def extract_key_facts(results: list[dict]) -> list[str]:
         answer = r.get("answer", "")
         if not answer:
             continue
-        # Get first meaningful paragraph
+        # Skip metadata lines, find actual answer content
         lines = [l.strip() for l in answer.split("\n") if l.strip()]
+        skip_prefixes = ("答案", "链接", "图片", "分享", "已完成", "进行中",
+                         "搜索结果", "新闻", "视频", r.get("query", ""))
         for line in lines:
-            # Skip headers and metadata
-            if line.startswith(("答案", "链接", "图片", "分享", "已完成")):
+            if any(line.startswith(p) for p in skip_prefixes):
                 continue
-            if len(line) > 30:
+            if len(line) > 40 and not line.startswith(("http", "www.")):
                 facts.append(line[:300])
                 break
     return facts
