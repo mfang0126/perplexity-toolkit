@@ -1,7 +1,10 @@
 """Configuration management for Perplexity Toolkit."""
 
+import logging
 import os
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,6 +79,7 @@ def _env_overrides(cfg: Config) -> Config:
             except ValueError:
                 continue
         setattr(cfg, field_name, value)
+        logger.debug("Config override: %s=%r (from env %s)", field_name, value, env_name)
     return cfg
 
 

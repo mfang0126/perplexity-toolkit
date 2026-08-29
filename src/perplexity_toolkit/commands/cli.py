@@ -5,6 +5,10 @@ import logging
 import json
 import sys
 
+from ..config import set_config
+
+logger = logging.getLogger(__name__)
+
 
 def cmd_search(args):
     """Single search."""
@@ -48,7 +52,7 @@ def cmd_batch(args):
     for q in (args.queries or []):
         queries.append({"query": q, "mode": args.mode})
     if not queries:
-        print("No queries provided.", file=sys.stderr)
+        logger.warning("No queries provided.")
         sys.exit(1)
     run_batch(queries, output_file=args.output, resume=args.resume,
               progress_file=args.progress if args.resume else None,
@@ -93,7 +97,7 @@ def cmd_history(args):
         drv.navigate(get_config().base_url, new_tab=True)
         import time; time.sleep(get_config().page_load_wait)
         if not args.query:
-            print("Error: provide a search query", file=sys.stderr)
+            logger.warning("Error: provide a search query")
             sys.exit(1)
         convos = find_conversation(drv, args.query)
         for i, c in enumerate(convos, 1):
@@ -102,14 +106,15 @@ def cmd_history(args):
 
     elif args.action == "delete":
         if not args.query and not args.href:
-            print("Error: provide --query or --href", file=sys.stderr)
+            logger.warning("Error: provide --query or --href")
             sys.exit(1)
         result = delete_conversations(query=args.query, hrefs=args.href,
                                        limit=args.limit, dry_run=args.dry_run)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
         prog="perplexity",
         description="Perplexity Toolkit — automate Perplexity AI search",
@@ -152,6 +157,11 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
     p.add_argument("--href", nargs="*", help="Specific conversation UUIDs to delete")
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     # Apply global config overrides
     cfg_overrides = {}

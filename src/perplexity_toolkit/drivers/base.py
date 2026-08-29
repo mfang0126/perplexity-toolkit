@@ -1,7 +1,10 @@
 """Abstract browser driver interface."""
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserDriver(ABC):

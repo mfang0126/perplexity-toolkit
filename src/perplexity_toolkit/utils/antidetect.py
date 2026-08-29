@@ -231,3 +231,15 @@ def combined_extract(driver: "BrowserDriver") -> dict:
         except json.JSONDecodeError:
             return {"answer": "", "sources": [], "follow_ups": []}
     return result if isinstance(result, dict) else {"answer": "", "sources": [], "follow_ups": []}
+
+
+def lognormal_delay(mu: float = -0.5, sigma: float = 0.5):
+    """Lognormal delay — fast responses common, slow ones rare."""
+    delay = random.lognormvariate(mu, sigma)
+    time.sleep(delay)
+
+
+def distraction_delay(chance: float = 0.05, lo: float = 3.0, hi: float = 5.0):
+    """Occasional long pause simulating human distraction (5% default)."""
+    if random.random() < chance:
+        time.sleep(random.uniform(lo, hi))
