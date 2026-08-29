@@ -320,6 +320,341 @@ def perplexity_follow_up(follow_up_text, wait_seconds=15):
     })()""")
 
 
+def _activate_search_mode(mode_name, session=SESSION):
+    """Activate a search mode via '/' menu.
+    
+    Args:
+        mode_name: Partial match for the mode, e.g. "深度研究", "模型委员会", "逐步学习"
+    """
+    # Type '/' to trigger search mode selector
+    wb("cdp", {"method": "Input.insertText", "params": {"text": "/"}})
+    time.sleep(1)
+    
+    # Snapshot to find menu items
+    resp = wb("snapshot", {})
+    tree = resp.get("data", {}).get("tree", "")
+    s = json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
+    
+    # Find the menuitem matching mode_name
+    target_ref = None
+    for m in re.finditer(
+        rf'"role":"menuitem","name":"([^"]*{re.escape(mode_name)}[^"]*)","ref":"(@e\d+)"',
+        s
+    ):
+        target_ref = m.group(2)
+        break
+    
+    if not target_ref:
+        return False
+    
+    # Click the mode
+    wb("click", {"selector": target_ref})
+    time.sleep(1)
+    return True
+
+
+def _select_model(model_name, session=SESSION):
+    """Switch the AI model via the model selector dropdown.
+    
+    Args:
+        model_name: Partial match for the model name, e.g. "Claude", "GPT", "Sonnet"
+    """
+    # Find and click the model selector button (has a model name + "⌵")
+    resp = wb("snapshot", {})
+    tree = resp.get("data", {}).get("tree", "")
+    s = json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
+    
+    # Find model selector button - it's a button with the current model name
+    model_ref = None
+    for m in re.finditer(r'"role":"button","name":"([^"]{2,40})","ref":"(@e\d+)"', s):
+        name, ref = m.groups()
+        # Model buttons typically contain known model names
+        if any(mn in name for mn in ["Grok", "Claude", "GPT", "Sonnet", "Opus", "o3", "o4", "Gemini"]):
+            model_ref = ref
+            break
+    
+    if not model_ref:
+        return False
+    
+    # Click the model selector
+    wb("click", {"selector": model_ref})
+    time.sleep(1)
+    
+    # Snapshot again to find the dropdown options
+    resp = wb("snapshot", {})
+    tree = resp.get("data", {}).get("tree", "")
+    s = json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
+    
+    # Find the target model in dropdown
+    target_ref = None
+    for m in re.finditer(
+        rf'"role":"(option|menuitem|button)","name":"([^"]*{re.escape(model_name)}[^"]*)","ref":"(@e\d+)"',
+        s
+    ):
+        target_ref = m.group(3)
+        break
+    
+    if not target_ref:
+        # Close the dropdown by pressing Escape
+        wb("cdp", {"method": "Input.dispatchKeyEvent", 
+                    "params": {"type": "keyDown", "key": "Escape"}})
+        return False
+    
+    wb("click", {"selector": target_ref})
+    time.sleep(1)
+    return True
+
+
+def perplexity_deep_research(query, wait_seconds=90, new_tab=True):
+    """
+    Search Perplexity using Deep Research mode.
+    
+    Deep Research uses multiple steps (4+) and produces longer, more
+    detailed answers. Takes 60-120 seconds.
+    
+    Args:
+        query: Search query string
+        wait_seconds: How long to wait (default 90, Deep Research is slow)
+        new_tab: Whether to open in a new tab
+    
+    Returns:
+        dict with: answer, sources, url, title, follow_ups, mode
+    """
+    # 1. Navigate
+    wb("navigate", {
+        "url": "https://www.perplexity.ai",
+        "newTab": new_tab,
+        "group_title": f"Deep Research: {query[:50]}"
+    })
+    time.sleep(4)
+    
+    # 2. Find and click textbox
+    textbox_ref = find_textbox_ref()
+    if not textbox_ref:
+        return {"error": "Could not find textbox", "answer": None, "sources": [],
+                "url": "", "title": "", "follow_ups": [], "mode": "deep_research"}
+    wb("click", {"selector": textbox_ref})
+    time.sleep(0.5)
+    
+    # 3. Activate Deep Research mode
+    if not _activate_search_mode("深度研究"):
+        return {"error": "Could not activate Deep Research mode", "answer": None,
+                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "deep_research"}
+    
+    wb("cdp", {"method": "Input.insertText", "params": {"text": query}})
+    time.sleep(0.5)
+    
+    # 5. Submit
+    evaluate("""(() => {
+        const el = document.querySelector("[contenteditable]");
+        if (!el) return "no input";
+        el.dispatchEvent(new InputEvent("beforeinput", {
+            inputType: "insertText", data: "\\n", bubbles: true, cancelable: true
+        }));
+        el.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", keyCode: 13, which: 13,
+            bubbles: true, cancelable: true
+        }));
+        el.dispatchEvent(new KeyboardEvent("keyup", {
+            key: "Enter", code: "Enter", keyCode: 13, which: 13,
+            bubbles: true, cancelable: true
+        }));
+        return "submitted";
+    })()""")
+    
+    # 6. Wait for results (Deep Research is slow)
+    # Check periodically for completion
+    for i in range(wait_seconds // 15):
+        time.sleep(15)
+        status = evaluate("""(() => {
+            const btns = Array.from(document.querySelectorAll("button"));
+            const done = btns.find(b => b.innerText.includes("已完成"));
+            const steps = done ? done.innerText : "in progress";
+            return JSON.stringify({url: location.href, status: steps});
+        })()""")
+        if isinstance(status, dict) and "/search/" in status.get("url", ""):
+            # Check if it shows completed steps
+            status_text = status.get("status", "")
+            if "已完成" in status_text:
+                break
+    
+    # 7. Extract results (same as regular search but no expand needed)
+    page_info = evaluate("""(() => {
+        return JSON.stringify({url: location.href, title: document.title});
+    })()""")
+    url = page_info.get("url", "") if isinstance(page_info, dict) else ""
+    title = page_info.get("title", "") if isinstance(page_info, dict) else ""
+    
+    # 8. Extract answer
+    answer_data = evaluate("""(() => {
+        const main = document.querySelector("main");
+        if (!main) return JSON.stringify({text: ""});
+        return JSON.stringify({text: main.innerText, url: location.href, title: document.title});
+    })()""")
+    answer_text = answer_data.get("text", "") if isinstance(answer_data, dict) else ""
+    url = (answer_data.get("url", url) if isinstance(answer_data, dict) else url)
+    
+    # 9. Extract sources
+    evaluate("""(() => {
+        const tabs = Array.from(document.querySelectorAll("[role=tab]"));
+        const t = tabs.find(t => t.innerText.includes("链接"));
+        if (t) t.click();
+    })()""")
+    time.sleep(1)
+    
+    sources_raw = evaluate("""(() => {
+        const main = document.querySelector("main");
+        if (!main) return JSON.stringify([]);
+        const links = Array.from(main.querySelectorAll("a[href]"))
+            .map(a => ({text: a.textContent.trim().substring(0, 200), href: a.href}))
+            .filter(l => l.href.startsWith("http") && !l.href.includes("perplexity.ai") && l.text.length > 2);
+        const seen = new Set();
+        return JSON.stringify(links.filter(l => {if(seen.has(l.href))return false;seen.add(l.href);return true;}));
+    })()""")
+    sources = sources_raw if isinstance(sources_raw, list) else []
+    
+    # 10. Switch back to answer tab
+    evaluate("""(() => {
+        const tabs = Array.from(document.querySelectorAll("[role=tab]"));
+        const t = tabs.find(t => t.innerText.includes("答案"));
+        if (t) t.click();
+    })()""")
+    time.sleep(1)
+    
+    # 11. Follow-ups
+    follow_ups_raw = evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        return JSON.stringify(btns.map(b=>b.innerText.trim())
+            .filter(t=>t.length>20&&t.length<200
+                &&!t.includes("分享")&&!t.includes("搜索")&&!t.includes("Computer")
+                &&!t.includes("Ming")&&!t.includes("Pro")&&!t.includes("添加")
+                &&!t.includes("展开")&&!t.includes("完成")&&!t.includes("来源")
+                &&!t.includes("会话")).slice(0,5));
+    })()""")
+    follow_ups = follow_ups_raw if isinstance(follow_ups_raw, list) else []
+    
+    return {
+        "answer": answer_text,
+        "sources": sources,
+        "url": url,
+        "title": title,
+        "follow_ups": follow_ups,
+        "mode": "deep_research"
+    }
+
+
+def perplexity_model_council(query, wait_seconds=25, new_tab=True):
+    """
+    Search Perplexity using Model Council mode (multiple models answer).
+    """
+    wb("navigate", {
+        "url": "https://www.perplexity.ai",
+        "newTab": new_tab,
+        "group_title": f"Model Council: {query[:50]}"
+    })
+    time.sleep(4)
+    
+    textbox_ref = find_textbox_ref()
+    if not textbox_ref:
+        return {"error": "Could not find textbox", "answer": None, "sources": [],
+                "url": "", "title": "", "follow_ups": [], "mode": "model_council"}
+    wb("click", {"selector": textbox_ref})
+    time.sleep(0.5)
+    
+    if not _activate_search_mode("模型委员会"):
+        return {"error": "Could not activate Model Council", "answer": None,
+                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "model_council"}
+    
+    # Clear input via fill with empty string
+    textbox_ref2 = find_textbox_ref()
+    if textbox_ref2:
+        wb("fill", {"selector": textbox_ref2, "value": ""})
+    time.sleep(0.3)
+    time.sleep(0.3)
+    wb("cdp", {"method": "Input.insertText", "params": {"text": query}})
+    time.sleep(0.5)
+    
+    evaluate("""(() => {
+        const el = document.querySelector("[contenteditable]");
+        if (!el) return;
+        el.dispatchEvent(new InputEvent("beforeinput",{inputType:"insertText",data:"\\n",bubbles:true,cancelable:true}));
+        el.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",code:"Enter",keyCode:13,which:13,bubbles:true,cancelable:true}));
+        el.dispatchEvent(new KeyboardEvent("keyup",{key:"Enter",code:"Enter",keyCode:13,which:13,bubbles:true,cancelable:true}));
+    })()""")
+    
+    time.sleep(wait_seconds)
+    
+    # Extract results
+    page_info = evaluate("(() => JSON.stringify({url:location.href,title:document.title}))()")
+    url = page_info.get("url", "") if isinstance(page_info, dict) else ""
+    title = page_info.get("title", "") if isinstance(page_info, dict) else ""
+    
+    answer_data = evaluate("(() => { const m=document.querySelector('main'); return JSON.stringify({text:m?m.innerText:''}); })()")
+    answer_text = answer_data.get("text", "") if isinstance(answer_data, dict) else ""
+    
+    sources = []
+    follow_ups = []
+    
+    return {
+        "answer": answer_text, "sources": sources, "url": url,
+        "title": title, "follow_ups": follow_ups, "mode": "model_council"
+    }
+
+
+def perplexity_step_by_step(query, wait_seconds=20, new_tab=True):
+    """
+    Search Perplexity using Step-by-step Learning mode.
+    """
+    wb("navigate", {
+        "url": "https://www.perplexity.ai",
+        "newTab": new_tab,
+        "group_title": f"Step-by-step: {query[:50]}"
+    })
+    time.sleep(4)
+    
+    textbox_ref = find_textbox_ref()
+    if not textbox_ref:
+        return {"error": "Could not find textbox", "answer": None, "sources": [],
+                "url": "", "title": "", "follow_ups": [], "mode": "step_by_step"}
+    wb("click", {"selector": textbox_ref})
+    time.sleep(0.5)
+    
+    if not _activate_search_mode("逐步学习"):
+        return {"error": "Could not activate Step-by-step", "answer": None,
+                "sources": [], "url": "", "title": "", "follow_ups": [], "mode": "step_by_step"}
+    
+    # Clear input via fill with empty string
+    textbox_ref2 = find_textbox_ref()
+    if textbox_ref2:
+        wb("fill", {"selector": textbox_ref2, "value": ""})
+    time.sleep(0.3)
+    time.sleep(0.3)
+    wb("cdp", {"method": "Input.insertText", "params": {"text": query}})
+    time.sleep(0.5)
+    
+    evaluate("""(() => {
+        const el = document.querySelector("[contenteditable]");
+        if (!el) return;
+        el.dispatchEvent(new InputEvent("beforeinput",{inputType:"insertText",data:"\\n",bubbles:true,cancelable:true}));
+        el.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",code:"Enter",keyCode:13,which:13,bubbles:true,cancelable:true}));
+        el.dispatchEvent(new KeyboardEvent("keyup",{key:"Enter",code:"Enter",keyCode:13,which:13,bubbles:true,cancelable:true}));
+    })()""")
+    
+    time.sleep(wait_seconds)
+    
+    page_info = evaluate("(() => JSON.stringify({url:location.href,title:document.title}))()")
+    url = page_info.get("url", "") if isinstance(page_info, dict) else ""
+    title = page_info.get("title", "") if isinstance(page_info, dict) else ""
+    
+    answer_data = evaluate("(() => { const m=document.querySelector('main'); return JSON.stringify({text:m?m.innerText:''}); })()")
+    answer_text = answer_data.get("text", "") if isinstance(answer_data, dict) else ""
+    
+    return {
+        "answer": answer_text, "sources": [], "url": url,
+        "title": title, "follow_ups": [], "mode": "step_by_step"
+    }
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python perplexity_search.py 'your query here'")
