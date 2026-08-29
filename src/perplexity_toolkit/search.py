@@ -18,6 +18,7 @@ from .utils.antidetect import (
     combined_snapshot_and_info, combined_extract,
 )
 from .utils.i18n import get_ui_string
+from .verify import verify_result
 
 logger = logging.getLogger(__name__)
 
@@ -325,10 +326,14 @@ def _search_core(
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
     expand: Optional[bool] = None, new_tab: bool = True,
+    verify: bool = True,
 ) -> SearchResult:
-    """Run the Perplexity pipeline with retry."""
+    """Run the Perplexity pipeline with retry and quality verification."""
     cfg = config or get_config()
-    return _search_with_retry(query, mode, cfg, driver, wait_seconds, expand, new_tab)
+    result = _search_with_retry(query, mode, cfg, driver, wait_seconds, expand, new_tab)
+    if verify and not result.get("error"):
+        result = verify_result(result)
+    return result
 
 
 # ──────────────────────────────────────────────

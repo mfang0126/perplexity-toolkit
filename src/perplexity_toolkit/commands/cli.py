@@ -22,6 +22,22 @@ def cmd_search(args):
         for i, s in enumerate(result.get("sources", []), 1):
             print(f"  {i}. {s.get('text', '')[:80]} → {s.get('href', '')}")
 
+    # Show verification results if available
+    quality = result.get("quality")
+    if quality:
+        print(f"\n--- Quality Check ---")
+        ac = quality.get("answer_check", {})
+        sc = quality.get("source_check", {})
+        print(f"Answer score: {ac.get('score', '?')}/100")
+        if ac.get("issues"):
+            for issue in ac["issues"]:
+                print(f"  ⚠ {issue}")
+        if sc.get("total", 0) > 0:
+            print(f"Sources: {sc['valid']}/{sc['total']} reachable")
+            for b in sc.get("broken_urls", []):
+                print(f"  ✗ [{b['status']}] {b['href']}")
+        print(f"Verdict: {quality.get('verdict', '?')} — {quality.get('suggestion', '')}")
+
 
 def cmd_batch(args):
     """Batch search."""
@@ -101,6 +117,7 @@ def main():
     parser.add_argument("-w", "--wait", type=float, help="Search wait time (seconds)")
     parser.add_argument("-r", "--retries", type=int, help="Max retries")
     parser.add_argument("-b", "--backend", help="Driver backend (webbridge, playwright)")
+    parser.add_argument("--verify", action="store_true", help="Verify sources and answer quality")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     sub = parser.add_subparsers(dest="command")
 
