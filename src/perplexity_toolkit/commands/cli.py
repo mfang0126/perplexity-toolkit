@@ -55,6 +55,44 @@ def cmd_aggregate(args):
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+def cmd_history(args):
+    """Manage search history."""
+    from ..history import list_conversations, find_conversation, delete_conversations
+    if args.action == "list":
+        from ..config import get_config
+        from ..drivers import create_driver
+        drv = create_driver(get_config())
+        from ..config import get_config as gc
+        drv.navigate(gc().base_url, new_tab=True)
+        import time; time.sleep(gc().page_load_wait)
+        convos = list_conversations(drv, args.limit)
+        for i, c in enumerate(convos, 1):
+            print(f"{i}. {c['title'][:60]}  [{c['href'][:20]}...]")
+        print(f"\nTotal: {len(convos)} conversations")
+
+    elif args.action == "search":
+        from ..config import get_config
+        from ..drivers import create_driver
+        drv = create_driver(get_config())
+        drv.navigate(get_config().base_url, new_tab=True)
+        import time; time.sleep(get_config().page_load_wait)
+        if not args.query:
+            print("Error: provide a search query", file=sys.stderr)
+            sys.exit(1)
+        convos = find_conversation(drv, args.query)
+        for i, c in enumerate(convos, 1):
+            print(f"{i}. {c['title'][:60]}  [{c['href'][:20]}...]")
+        print(f"\nFound: {len(convos)} matching '{args.query}'")
+
+    elif args.action == "delete":
+        if not args.query and not args.href:
+            print("Error: provide --query or --href", file=sys.stderr)
+            sys.exit(1)
+        result = delete_conversations(query=args.query, hrefs=args.href,
+                                       limit=args.limit, dry_run=args.dry_run)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="perplexity",
@@ -88,6 +126,15 @@ def main():
     p.add_argument("files", nargs="+", help="Result JSON files")
     p.add_argument("-f", "--format", default="json", choices=["json", "markdown"])
 
+    # history
+    p = sub.add_parser("history", help="Manage search history")
+    p.add_argument("action", choices=["list", "search", "delete"],
+                   help="list: show all, search: find by title, delete: remove")
+    p.add_argument("query", nargs="?", help="Search query or title to match")
+    p.add_argument("--limit", type=int, default=50, help="Max conversations")
+    p.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
+    p.add_argument("--href", nargs="*", help="Specific conversation UUIDs to delete")
+
     args = parser.parse_args()
     # Apply global config overrides
     cfg_overrides = {}
@@ -110,6 +157,8 @@ def main():
         cmd_batch(args)
     elif args.command == "aggregate":
         cmd_aggregate(args)
+    elif args.command == "history":
+        cmd_history(args)
     else:
         parser.print_help()
 
