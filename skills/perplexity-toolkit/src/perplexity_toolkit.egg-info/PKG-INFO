@@ -1,0 +1,142 @@
+Metadata-Version: 2.4
+Name: perplexity-toolkit
+Version: 0.1.0
+Summary: Automate Perplexity AI search via browser control — search, extract, batch, and analyze.
+License: MIT
+Keywords: perplexity,ai,search,automation,browser
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Internet :: WWW/HTTP :: Browsers
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+
+# Perplexity Toolkit
+
+Automate Perplexity AI search via browser control — search, extract, batch, and analyze.
+
+## What It Does
+
+- **4 search modes**: Standard, Deep Research, Model Council, Step-by-step Learning
+- **Batch pipeline**: Search hundreds of queries with resume and rate limiting
+- **Result aggregation**: Dedup sources, rank by frequency, generate reports
+- **Source extraction**: Get all cited URLs with titles and snippets
+- **Follow-up capture**: Extract Perplexity's suggested follow-up questions
+
+## Quick Start
+
+```bash
+# Install
+pip install -e .
+
+# Single search
+perplexity search "best AI coding agents 2026"
+
+# Deep Research (multi-step, 60-120s)
+perplexity search "AI safety risks 2026" -m deep_research
+
+# Batch from file
+perplexity batch -i queries.json -o results.json
+
+# Aggregate results
+perplexity aggregate results.json -f markdown
+```
+
+## Python API
+
+```python
+from perplexity_toolkit.search import search, deep_research, model_council
+
+# Standard search
+result = search("Python vs Rust 2026")
+print(result["answer"])      # Full answer text
+print(result["sources"])     # [{text, href}, ...]
+print(result["follow_ups"])  # ["follow-up question", ...]
+
+# Deep Research (longer, more detailed)
+result = deep_research("AI agent frameworks comparison")
+
+# Model Council (multiple models answer)
+result = model_council("best programming language for beginners")
+```
+
+## Batch Pipeline
+
+```python
+from perplexity_toolkit.batch import run_batch
+
+queries = [
+    {"query": "topic 1", "mode": "search"},
+    {"query": "topic 2", "mode": "deep_research"},
+]
+results = run_batch(queries, output_file="results.json", delay=5.0)
+```
+
+## Architecture
+
+```
+perplexity_toolkit/
+├── __init__.py          # Package init
+├── config.py            # Configuration management
+├── search.py            # Core search functions (4 modes)
+├── batch.py             # Batch pipeline with resume
+├── aggregator.py        # Result aggregation + reports
+├── drivers/             # Browser driver abstraction
+│   ├── base.py          # Abstract BrowserDriver interface
+│   └── webbridge.py     # Kimi WebBridge implementation
+├── utils/               # DOM parsing + event helpers
+│   └── __init__.py
+└── commands/            # CLI
+    └── cli.py
+```
+
+## Browser Driver
+
+The toolkit uses an abstract `BrowserDriver` interface. Current implementation:
+
+- **WebBridgeDriver** — Kimi WebBridge (Chrome extension + local daemon)
+
+To add a new backend (Playwright, Selenium, etc.), implement `BrowserDriver` in `drivers/`:
+
+```python
+from perplexity_toolkit.drivers.base import BrowserDriver
+
+class PlaywrightDriver(BrowserDriver):
+    def navigate(self, url, new_tab=True, group_title=""): ...
+    def snapshot(self): ...
+    def click(self, selector): ...
+    def fill(self, selector, value): ...
+    def evaluate(self, code): ...
+    def screenshot(self, path=None): ...
+    def close(self): ...
+```
+
+## Requirements
+
+- Python 3.9+
+- Kimi WebBridge daemon (`~/.kimi-webbridge/bin/kimi-webbridge start`)
+- Chrome with Kimi WebBridge extension installed
+- Perplexity account (free or Pro)
+
+## Known Limitations
+
+- Deep Research mode leaks a "/" prefix in the query (Perplexity handles it gracefully)
+- Model selector dropdown requires CDP-level clicks (not yet automated)
+- File upload flow not yet mapped
+
+## Research
+
+See `docs/research/` for comprehensive analysis of Perplexity's known issues, API vs web gap, and browser automation mapping.
+
+## License
+
+MIT
