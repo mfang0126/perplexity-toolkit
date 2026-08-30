@@ -159,27 +159,30 @@ def _submit_started(driver) -> bool:
 
 
 def submit_query(driver):
-    """Submit the current query via a trusted CDP Enter key.
+    """Submit the current query.
 
-    Uses CDP Input.dispatchKeyEvent (isTrusted=true, real-keyboard path)
-    instead of synthetic dispatchEvent KeyboardEvents (isTrusted=false,
-    detectable by bot protection). Verifies the page started loading
-    results and retries once if no reaction is detected.
+    Strategy: click the 提交 button (most reliable), then verify.
+    Falls back to CDP Enter if button not found.
 
     Returns:
         str: "submitted", "submitted_retry", or "no submit detected".
     """
-    _press_enter(driver)
-    # Give the page time to react before checking (avoids a race where the
-    # input hasn't been cleared yet and a spurious retry presses Enter on an
-    # already-cleared field).
-    time.sleep(random.uniform(0.8, 1.4))
-    if _submit_started(driver):
-        return "submitted"
+    # Primary: click the submit button
+    clicked = driver.evaluate("""(() => {
+        const btn = document.querySelector('button[aria-label="提交"]');
+        if (btn) { btn.click(); return 'clicked'; }
+        return 'no button';
+    })()""")
 
-    # Retry once — first Enter may have landed before the field was focused.
+    if clicked == 'clicked':
+        time.sleep(random.uniform(1.0, 2.0))
+        if _submit_started(driver):
+            return "submitted"
+
+    # Fallback: CDP Enter
     _press_enter(driver)
     time.sleep(random.uniform(0.8, 1.4))
     if _submit_started(driver):
         return "submitted_retry"
+
     return "no submit detected"
