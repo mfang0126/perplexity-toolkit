@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.batch_progress
+batch_results.json
+*.json.tmp
+.DS_Store
+*.egg-info/
+__pycache__/
