@@ -85,7 +85,15 @@ class WebBridgeDriver(BrowserDriver):
         args = {"url": url, "newTab": new_tab}
         if group_title:
             args["group_title"] = group_title
-        return self._send("navigate", args)
+        result = self._send("navigate", args)
+        # If tab was closed/stale, retry with new_tab
+        if not result.get("ok") and not new_tab:
+            err = result.get("error", {}).get("message", "")
+            if "No tab" in err or "Bad Gateway" in err:
+                logger.warning("Tab stale, opening new tab")
+                args["newTab"] = True
+                result = self._send("navigate", args)
+        return result
 
     def snapshot(self) -> dict:
         return self._send("snapshot", {})
