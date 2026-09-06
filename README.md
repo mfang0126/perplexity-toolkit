@@ -13,8 +13,13 @@ Automate Perplexity AI search via browser control — search, extract, batch, an
 ## Quick Start
 
 ```bash
-# Install
-pip install -e .
+# Install so `perplexity` is on your PATH (recommended)
+pipx install git+https://github.com/mfang0126/perplexity-toolkit.git
+
+# ...or for development, into the CURRENT environment only:
+#   pip install -e .
+# If you use pip, install into the same environment your agent runs,
+# otherwise `command -v perplexity` will not find it.
 
 # Single search
 perplexity search "best AI coding agents 2026"
@@ -83,6 +88,11 @@ The toolkit uses an abstract `BrowserDriver` interface. Current implementation:
 
 - **WebBridgeDriver** — Kimi WebBridge (Chrome extension + local daemon)
 
+This is the **only** shipped backend. Every search mode drives a real logged-in
+browser through it; there is no API-key or headless path. `aggregate` is the one
+subcommand that runs without a browser, because it only post-processes result
+JSON you already fetched.
+
 To add a new backend (Playwright, Selenium, etc.), implement `BrowserDriver` in `drivers/`:
 
 ```python
@@ -104,6 +114,38 @@ class PlaywrightDriver(BrowserDriver):
 - Kimi WebBridge daemon (`~/.kimi-webbridge/bin/kimi-webbridge start`)
 - Chrome with Kimi WebBridge extension installed
 - Perplexity account (free or Pro)
+
+## Verify Your Setup
+
+Run these three checks in order. Each one isolates a different failure.
+
+```bash
+# 1. Is the command reachable?
+command -v perplexity && perplexity --help >/dev/null && echo "CLI OK"
+
+# 2. Is the WebBridge daemon up?
+curl -s -X POST http://127.0.0.1:10086/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"list_tabs"}'
+
+# 3. Is Chrome connected?
+#    Step 2 returns {"ok":true,...} when the daemon is up.
+#    If it reports "no extension connected", the daemon is running but Chrome
+#    is not attached — open Chrome and check the WebBridge extension.
+```
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `command -v perplexity` finds nothing | Installed into an environment that is not on your `PATH` | `pipx install git+https://github.com/mfang0126/perplexity-toolkit.git`, or export `PERPLEXITY_BIN=/full/path/to/perplexity` |
+| `curl` to port 10086 fails | Daemon not started | `~/.kimi-webbridge/bin/kimi-webbridge start` |
+| Daemon replies `no extension connected` | Chrome not attached | Open Chrome; confirm the WebBridge extension is enabled. This is **not** a rate limit or a thread cap |
+| Search returns an empty answer | Not logged in to Perplexity in that browser | Log in to perplexity.ai in the same Chrome profile |
+
+Note for agent authors: do not probe with a bare `python3 -c "import perplexity_toolkit"`.
+The toolkit lives in whichever environment it was installed into, which is usually
+not the interpreter that `python3` resolves to. Probe for the console script
+(`command -v perplexity`, `$PERPLEXITY_BIN`, `$VIRTUAL_ENV/bin/perplexity`) instead,
+and report "not resolved in this environment" rather than "not installed".
 
 ## Known Limitations
 
@@ -139,8 +181,13 @@ Perplexity Toolkit 通过浏览器控制自动化 Perplexity AI 搜索 — 支�
 ## 快速开始
 
 ```bash
-# 安装
-pip install -e .
+# 安装（推荐）：让 `perplexity` 进入 PATH
+pipx install git+https://github.com/mfang0126/perplexity-toolkit.git
+
+# 或开发模式，只装进「当前」环境：
+#   pip install -e .
+# 用 pip 时务必装进 agent 实际运行的那个环境，
+# 否则 `command -v perplexity` 找不到它。
 
 # 单次搜索
 perplexity search "2026 年最好的 AI 编程助手"
@@ -221,6 +268,10 @@ perplexity_toolkit/
 
 - **WebBridgeDriver** — Kimi WebBridge（Chrome 扩展 + 本地守护进程）
 
+这是**唯一**已实现的后端。所有搜索模式都通过它驱动真实的已登录浏览器，
+没有 API key 或无头模式路径。`aggregate` 是唯一不需要浏览器的子命令，
+因为它只对你已经抓取到的结果 JSON 做后处理。
+
 接入新后端（Playwright、Selenium 等）时，在 `drivers/` 下实现 `BrowserDriver`：
 
 ```python
@@ -242,6 +293,37 @@ class PlaywrightDriver(BrowserDriver):
 - Kimi WebBridge 守护进程（`~/.kimi-webbridge/bin/kimi-webbridge start`）
 - 已安装 Kimi WebBridge 扩展的 Chrome 浏览器
 - Perplexity 账号（免费版或 Pro 均可）
+
+## 安装后自检
+
+按顺序跑这三步，每一步隔离一类故障。
+
+```bash
+# 1. 命令是否可达？
+command -v perplexity && perplexity --help >/dev/null && echo "CLI OK"
+
+# 2. WebBridge 守护进程是否启动？
+curl -s -X POST http://127.0.0.1:10086/command \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"list_tabs"}'
+
+# 3. Chrome 是否已连接？
+#    守护进程正常时第 2 步返回 {"ok":true,...}。
+#    若返回 "no extension connected"，说明进程在跑但 Chrome 没接上——
+#    打开 Chrome 并检查 WebBridge 扩展。
+```
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `command -v perplexity` 找不到 | 装进了不在 `PATH` 上的环境 | `pipx install git+https://github.com/mfang0126/perplexity-toolkit.git`，或 `export PERPLEXITY_BIN=/完整/路径/perplexity` |
+| curl 连 10086 失败 | 守护进程没启动 | `~/.kimi-webbridge/bin/kimi-webbridge start` |
+| 守护进程返回 `no extension connected` | Chrome 未接入 | 打开 Chrome，确认 WebBridge 扩展已启用。这**不是**限流或会话数上限 |
+| 搜索返回空答案 | 该浏览器未登录 Perplexity | 在同一个 Chrome profile 登录 perplexity.ai |
+
+给 agent 作者的提醒：不要用裸的 `python3 -c "import perplexity_toolkit"` 做探测。
+工具包只存在于安装它的那个环境里，通常不是 `python3` 解析到的解释器。
+应改为探测可执行文件（`command -v perplexity`、`$PERPLEXITY_BIN`、
+`$VIRTUAL_ENV/bin/perplexity`），并把结果报告为「当前环境未解析到」而不是「未安装」。
 
 ## 已知限制
 

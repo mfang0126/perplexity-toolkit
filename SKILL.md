@@ -23,22 +23,46 @@ Automate Perplexity AI search via browser control — search, extract, batch, an
 
 ## Quick Start
 
+Install so that `perplexity` lands on your `PATH` — this matters because agents
+often invoke a different interpreter than the one you ran `pip` with:
+
+```bash
+pipx install git+https://github.com/mfang0126/perplexity-toolkit.git
+```
+
+For development, install into the environment your agent actually runs:
+
 ```bash
 git clone https://github.com/mfang0126/perplexity-toolkit.git
 cd perplexity-toolkit
-pip install -e .
+pip install -e .          # installs into the CURRENT environment only
+```
+
+Verify the command is reachable:
+
+```bash
+command -v perplexity && perplexity --help
 ```
 
 ## CLI
 
 ```bash
-perplexity search "query"                    # Standard search
-perplexity search "query" --mode deep        # Deep research
-perplexity search "query" --mode council     # Model council
-perplexity batch queries.txt                 # Batch from file
-perplexity aggregate results/ --output report.md
-perplexity history                           # View search history
+perplexity search "query"                            # Standard search
+perplexity search "query" -m deep_research           # Deep research
+perplexity search "query" -m model_council           # Model council
+perplexity search "query" -f json                    # JSON output
+
+perplexity batch -i queries.json -o results.json     # Batch from file
+perplexity batch -i queries.json -o out.json -r      # Resume an interrupted batch
+
+perplexity aggregate results.json -f markdown        # Aggregate (no browser needed)
+
+perplexity history list --limit 20                   # List past conversations
+perplexity history search "topic"                    # Find by title
 ```
+
+Valid `-m/--mode` values: `search`, `deep_research`, `model_council`,
+`step_by_step`. `history` requires an action (`list`, `search`, or `delete`).
 
 ## 4 Search Modes
 
@@ -52,5 +76,11 @@ perplexity history                           # View search history
 ## Requirements
 
 - Python 3.10+
-- Playwright (browser automation)
-- Perplexity account (free tier works)
+- Google Chrome with the Kimi WebBridge extension, and the WebBridge daemon
+  reachable at `http://127.0.0.1:10086/command`
+  (override with `PERPLEXITY_WEBBRIDGE_URL`)
+- A Perplexity account already logged in inside that browser (free tier works)
+
+Every search mode drives the real browser through WebBridge; there is no API-key
+or headless path. `aggregate` is the only subcommand that runs without a browser,
+because it only post-processes result JSON you already fetched.
