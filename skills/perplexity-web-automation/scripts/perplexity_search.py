@@ -27,6 +27,35 @@ For a task-specific WebBridge tab group:
 Multi-query tasks: only the first query opens a tab (perplexity_batch_search uses
 new_tab=(i == 0)); later queries must explicitly pass new_tab=False so subsequent
 searches reuse the current tab in the same task session.
+
+--------------------------------------------------------------------------
+DESIGN CONSTRAINT: this file must stay dependency-free. Do not "deduplicate"
+it against perplexity_toolkit.
+
+Yes, it reimplements logic that also lives in perplexity_toolkit.search. That
+overlap is deliberate, not technical debt. This script imports only the
+standard library and shells out to curl, so it runs under any python3 with
+nothing installed. The toolkit cannot: it needs its own package (config,
+drivers, utils, i18n, verify) to be importable.
+
+That difference is the entire point. This script is the fallback for the case
+where the toolkit is not resolvable — which is a real, observed failure mode,
+not a hypothetical one: a toolkit installed into one environment is invisible
+to an agent running a different interpreter. Making this file import
+perplexity_toolkit would delete the capability exactly when it is needed, and
+the loss would only surface on the day the toolkit breaks.
+
+If you are here to merge the two implementations, the correct change is
+usually none. If the shared logic genuinely needs to move, extract it into a
+vendored stdlib-only module inside this scripts/ directory — do not reach into
+the installed package.
+
+Deliberate omission: there is no retry/backoff here (the toolkit has
+_search_with_retry). A diagnostic tool should surface the raw failure rather
+than mask it behind retries. If this script is ever promoted from "fallback
+and diagnostic" to "general executor", revisit that decision explicitly rather
+than adding retries by reflex.
+--------------------------------------------------------------------------
 """
 
 import json
