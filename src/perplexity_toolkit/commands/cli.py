@@ -115,13 +115,25 @@ def cmd_history(args):
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser with all subcommands."""
+    # Imported here rather than at module scope to keep CLI startup lazy, in
+    # line with the other driver imports in this file.
+    from ..drivers import DRIVER_REGISTRY
+
+    backends = sorted(DRIVER_REGISTRY)
+
     parser = argparse.ArgumentParser(
         prog="perplexity",
         description="Perplexity Toolkit — automate Perplexity AI search",
     )
     parser.add_argument("-w", "--wait", type=float, help="Search wait time (seconds)")
     parser.add_argument("-r", "--retries", type=int, help="Max retries")
-    parser.add_argument("-b", "--backend", help="Driver backend (webbridge, playwright)")
+    # Choices come from the registry so this flag can never advertise a backend
+    # that is not actually implemented, and an unknown value is rejected here
+    # rather than silently falling back to webbridge.
+    parser.add_argument(
+        "-b", "--backend", choices=backends,
+        help=f"Driver backend ({', '.join(backends)})",
+    )
     parser.add_argument("--verify", action="store_true", help="Verify sources and answer quality")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     sub = parser.add_subparsers(dest="command")
