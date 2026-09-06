@@ -9,6 +9,7 @@ Automate Perplexity AI search via browser control — search, extract, batch, an
 - **Result aggregation**: Dedup sources, rank by frequency, generate reports
 - **Source extraction**: Get all cited URLs with titles and snippets
 - **Follow-up capture**: Extract Perplexity's suggested follow-up questions
+- **Agent skills**: Three ready-to-load `SKILL.md` files in [`skills/`](skills/) — routing policy, session discipline, and the verification rule — for agents that drive this toolkit
 
 ## Quick Start
 
@@ -177,6 +178,7 @@ Perplexity Toolkit 通过浏览器控制自动化 Perplexity AI 搜索 — 支�
 - **来源提取**：获取所有引用链接，含标题与摘要
 - **追问捕获**：提取 Perplexity 推荐的后续追问问题
 - **历史管理**：查看与管理搜索历史
+- **Agent Skills**：[`skills/`](skills/) 下三份可直接加载的 `SKILL.md`——路由策略、会话纪律、验证规则——供驱动本工具包的 agent 使用
 
 ## 快速开始
 
