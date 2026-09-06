@@ -12,7 +12,9 @@ class Config:
     """Global configuration."""
 
     # Browser driver
-    driver_backend: str = "webbridge"  # 'webbridge', 'playwright', 'selenium'
+    # Only 'webbridge' is implemented. See drivers/DRIVER_REGISTRY — that is the
+    # authoritative list; do not name aspirational backends here.
+    driver_backend: str = "webbridge"
     locale: str = "zh"  # 'zh' or 'en'
     webbridge_url: str = "http://127.0.0.1:10086/command"
     session_prefix: str = "perplexity"
