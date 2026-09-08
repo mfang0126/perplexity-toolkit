@@ -14,6 +14,16 @@ metadata:
 
 Automate Perplexity AI search via browser control — search, extract, batch, and analyze.
 
+## Route boundary
+
+The `perplexity` CLI is the default user-facing route for Perplexity requests
+that do not explicitly ask for a web page, browser, Chrome, or WebBridge. The
+CLI currently uses the toolkit's only shipped `WebBridgeDriver` underneath;
+it is not an API or headless backend. Direct browser actions are reserved for
+explicit browser/WebBridge requests and use `perplexity-web-automation` with
+`kimi-webbridge` and its hygiene pair. CLI failure must not silently switch to
+the user's browser.
+
 ## When to Use
 
 - Batch search hundreds of queries with resume support

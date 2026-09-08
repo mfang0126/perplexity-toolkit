@@ -9,8 +9,7 @@ Based on community-reported problems (297+ Reddit posts):
 import logging
 import re
 import urllib.request
-import urllib.error
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -33,26 +32,115 @@ _WEAK_INDICATORS = [
 ]
 
 
-def verify_sources(sources: List[Dict], timeout: float = 5.0, max_workers: int = 5) -> Dict:
-    """Check if cited URLs actually exist (HTTP HEAD).
+_READBACK_MAX_BYTES = 256 * 1024
+_TEXT_CONTENT_TYPES = (
+    "text/", "application/json", "application/xml", "application/xhtml+xml",
+)
 
-    Returns:
-        {total, valid, broken, broken_urls: [{text, href, status}]}
+
+def _status_ok(status: int) -> bool:
+    try:
+        return 200 <= int(status) < 400
+    except (TypeError, ValueError):
+        return False
+
+
+def _content_type(headers) -> str:
+    """Read a response content type without assuming a concrete headers type."""
+    try:
+        value = headers.get_content_type()
+        if value:
+            return str(value).lower()
+    except (AttributeError, TypeError):
+        pass
+    try:
+        value = headers.get("Content-Type", "")
+    except AttributeError:
+        value = ""
+    return str(value).split(";", 1)[0].strip().lower()
+
+
+def _readback_source(src: Dict, timeout: float) -> Dict:
+    """Fetch bounded page content for a source without retaining the body."""
+    url = src.get("href", "")
+    base = {"text": src.get("text", "")[:80], "href": url,
+            "claim_support": "not_evaluated"}
+    if not url or not url.startswith("http"):
+        return {**base, "status": 0, "state": "invalid"}
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "perplexity-toolkit-source-check/1.0"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 0)
+            content_type = _content_type(getattr(resp, "headers", {}))
+            raw = resp.read(_READBACK_MAX_BYTES)
+            if isinstance(raw, str):
+                chars = len(raw)
+            else:
+                charset = "utf-8"
+                try:
+                    charset = resp.headers.get_content_charset() or charset
+                except (AttributeError, TypeError):
+                    pass
+                text = raw.decode(charset, errors="replace")
+                chars = len(text)
+
+            if not _status_ok(status):
+                state = "blocked"
+            elif content_type and not content_type.startswith(_TEXT_CONTENT_TYPES):
+                state = "non_text"
+            elif chars == 0:
+                state = "empty"
+            else:
+                state = "readable"
+            return {**base, "status": status, "state": state,
+                    "content_type": content_type, "characters": chars}
+    except Exception as exc:
+        return {**base, "status": getattr(exc, "code", 0),
+                "state": "error", "error_type": type(exc).__name__}
+
+
+def verify_sources(
+    sources: List[Dict], timeout: float = 5.0, max_workers: int = 5,
+    readback: bool = False,
+) -> Dict:
+    """Check source reachability and optionally read back bounded page content.
+
+    ``valid``/``broken`` describe the HTTP HEAD check only. When ``readback``
+    is true, ``page_content`` reports whether a text response was actually
+    readable. Neither check proves that a page supports a particular claim;
+    each entry therefore carries ``claim_support: not_evaluated``.
     """
+    empty = {"total": 0, "valid": 0, "broken": 0, "broken_urls": []}
     if not sources:
-        return {"total": 0, "valid": 0, "broken": 0, "broken_urls": []}
+        if readback:
+            empty.update({
+                "page_content": [],
+                "readback": {
+                    "attempted": 0, "readable": 0, "unreadable": 0,
+                    "claim_support": "not_evaluated",
+                },
+            })
+        return empty
 
     def check_url(src):
         url = src.get("href", "")
         if not url or not url.startswith("http"):
             return src, 0
         try:
-            req = urllib.request.Request(url, method="HEAD")
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "perplexity-toolkit-source-check/1.0"},
+                method="HEAD",
+            )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return src, resp.status
-        except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
-            status = getattr(e, "code", 0)
-            return src, status
+                return src, getattr(resp, "status", 0)
+        except Exception as exc:
+            return src, getattr(exc, "code", 0)
 
     broken = []
     valid = 0
@@ -60,7 +148,7 @@ def verify_sources(sources: List[Dict], timeout: float = 5.0, max_workers: int =
         futures = {pool.submit(check_url, s): s for s in sources}
         for f in as_completed(futures):
             src, status = f.result()
-            if 200 <= status < 400:
+            if _status_ok(status):
                 valid += 1
             else:
                 broken.append({
@@ -73,14 +161,31 @@ def verify_sources(sources: List[Dict], timeout: float = 5.0, max_workers: int =
         "total": len(sources),
         "valid": valid,
         "broken": len(broken),
-        "broken_urls": broken,
+        "broken_urls": sorted(broken, key=lambda item: item["href"]),
     }
+
+    if readback:
+        page_content = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_readback_source, s, timeout): s for s in sources}
+            for f in as_completed(futures):
+                page_content.append(f.result())
+        page_content.sort(key=lambda item: item["href"])
+        readable = sum(item["state"] == "readable" for item in page_content)
+        result["page_content"] = page_content
+        result["readback"] = {
+            "attempted": len(page_content),
+            "readable": readable,
+            "unreadable": len(page_content) - readable,
+            "claim_support": "not_evaluated",
+        }
+
     if broken:
-        logger.warning("Broken sources: %d/%d URLs unreachable", len(broken), len(sources))
-        for b in broken:
+        logger.warning("Broken sources: %d/%d URLs unreachable by HEAD", len(broken), len(sources))
+        for b in result["broken_urls"]:
             logger.warning("  ✗ %s [%d] %s", b["text"][:50], b["status"], b["href"])
     else:
-        logger.info("All %d sources verified", valid)
+        logger.info("All %d sources responded to HEAD", valid)
     return result
 
 
@@ -175,20 +280,31 @@ def verify_result(result: dict, verify_urls: bool = True) -> dict:
     answer = result.get("answer", "")
     sources = result.get("sources", [])
 
-    quality = {
+    quality: Dict[str, Any] = {
         "answer_check": check_answer_quality(answer, sources),
     }
 
     if verify_urls and sources:
-        quality["source_check"] = verify_sources(sources)
+        # A HEAD response only proves that a URL answered. Read back bounded
+        # page content as a separate diagnostic and keep claim support
+        # explicitly unevaluated until a semantic evidence pass is performed.
+        quality["source_check"] = verify_sources(sources, readback=True)
+        quality["verification_state"] = "candidate"
+        quality["claim_support"] = "not_evaluated"
     else:
         quality["source_check"] = {"total": 0, "valid": 0, "broken": 0, "broken_urls": []}
+        quality["verification_state"] = "unverified"
+        quality["claim_support"] = "not_evaluated"
 
     # Overall quality verdict
     answer_score = quality["answer_check"]["score"]
     broken_ratio = 0
     if quality["source_check"]["total"] > 0:
-        broken_ratio = quality["source_check"]["broken"] / quality["source_check"]["total"]
+        readback = quality["source_check"].get("readback", {})
+        if readback:
+            broken_ratio = readback["unreadable"] / readback["attempted"]
+        else:
+            broken_ratio = quality["source_check"]["broken"] / quality["source_check"]["total"]
 
     if answer_score < 50 or broken_ratio > 0.5:
         quality["verdict"] = "poor"
@@ -198,7 +314,10 @@ def verify_result(result: dict, verify_urls: bool = True) -> dict:
         quality["suggestion"] = "Some issues detected. Verify key claims before using."
     else:
         quality["verdict"] = "good"
-        quality["suggestion"] = "Answer appears reliable."
+        quality["suggestion"] = (
+            "Answer appears reliable at a heuristic level; canonical claim "
+            "support still requires semantic review."
+        )
 
     logger.info("Quality verdict: %s (answer=%d, broken_sources=%d/%d)",
                 quality["verdict"], answer_score,

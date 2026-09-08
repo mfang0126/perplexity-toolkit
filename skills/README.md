@@ -1,24 +1,42 @@
 # Agent skills
 
-The CLI in this repo is only half of the story. These three skills carry the
-operational knowledge an agent needs to drive Perplexity well: which route to
-take, how to keep browser sessions from fragmenting, and when an answer is
-allowed to be called verified.
+The CLI in this repo is the default Perplexity execution route. The direct
+browser route is an explicit user choice. These three skills carry the
+operational knowledge an agent needs to route Perplexity work safely: which
+route to take, how to keep browser sessions from fragmenting, and when an
+answer is allowed to be called verified.
 
 They are plain Markdown with YAML frontmatter, so any agent framework that
 loads `SKILL.md` files can use them.
+
+## Route contract
+
+There are two user-facing routes:
+
+1. If the user explicitly says **web page, browser, Chrome, WebBridge, Kimi
+   WebBridge, open Perplexity, or continue the current browser thread**, use
+   `perplexity-web-automation` directly. Do not invoke the CLI first.
+2. For every other Perplexity request, use the `perplexity` CLI first. If the
+   CLI is unavailable or fails, stop and report that fact; do not silently
+   switch to the user's browser. Switch only after the user explicitly allows
+   the browser route.
+
+The current CLI is a CLI interface over the toolkit's WebBridge driver. It is
+not an API or headless backend; even the default CLI route ultimately uses
+Kimi WebBridge and Chrome.
 
 ## What each one is for
 
 | Skill | Layer | Use it for |
 |---|---|---|
-| `perplexity-search` | Policy | Quick lookups. **Owns the canonical definition** of the candidate-vs-verified boundary and the HEAD-vs-readback rule |
-| `perplexity-conversational-research` | Workflow | Deep or multi-turn research. Picks between the CLI and the browser route, and keeps one session across follow-ups |
-| `perplexity-web-automation` | Execution | The low-level logged-in Chrome / WebBridge actions, plus a standalone `scripts/perplexity_search.py` helper |
+| `perplexity-search` | Policy | Quick lookups and the shared source-verification contract |
+| `perplexity-conversational-research` | Router/workflow | Applies the route contract (also available as local `perplexity route`) and organizes deep or multi-turn research |
+| `perplexity-web-automation` | Direct-web execution | Perplexity-specific logged-in Chrome / WebBridge actions, plus the standalone helper |
 
-They are designed to be loaded together. `perplexity-search` is the single
-source of truth for the verification rule; the other two link to it rather
-than restating it, so the rule can be changed in one place.
+`perplexity-search` owns the canonical candidate-vs-verified boundary and the
+HEAD-vs-readback rule. The other skills reference it rather than restating it.
+Choose one high-level route per task; do not load all three as competing
+workflows.
 
 ## Install
 
@@ -41,13 +59,15 @@ Then `git pull` in the clone to update all three at once.
 ## Two reliability tiers, on purpose
 
 `perplexity-web-automation/scripts/perplexity_search.py` reimplements logic that
-also exists in `perplexity_toolkit.search`. That overlap is deliberate.
+also exists in `perplexity_toolkit.search`. That overlap is deliberate, but the
+script is an **explicitly authorized fallback/diagnostic**, not an automatic
+route switch.
 
 | | `perplexity_toolkit` | `perplexity_search.py` |
 |---|---|---|
 | Imports | its own package (config, drivers, utils, i18n, verify) | standard library only, shells out to `curl` |
-| Runs when nothing is installed | no | yes |
-| Role | primary executor | fallback and diagnostic |
+| Runs when nothing is installed | no | yes, only after the user permits the direct-browser route |
+| Role | primary CLI executor | explicit direct-browser helper and diagnostic |
 | Retry / backoff | yes (`_search_with_retry`) | none, by design |
 
 The script's independence is its entire value. A toolkit installed into one

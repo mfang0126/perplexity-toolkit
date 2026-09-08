@@ -38,12 +38,11 @@ standard library and shells out to curl, so it runs under any python3 with
 nothing installed. The toolkit cannot: it needs its own package (config,
 drivers, utils, i18n, verify) to be importable.
 
-That difference is the entire point. This script is the fallback for the case
-where the toolkit is not resolvable — which is a real, observed failure mode,
-not a hypothetical one: a toolkit installed into one environment is invisible
-to an agent running a different interpreter. Making this file import
-perplexity_toolkit would delete the capability exactly when it is needed, and
-the loss would only surface on the day the toolkit breaks.
+That difference is the entire point. This helper is part of the explicit
+direct-browser route. Toolkit/CLI unavailability alone must never invoke it
+automatically; the high-level skill must first obtain authorization for the
+browser route. It remains dependency free so an already-authorized browser
+task can still be diagnosed when the installed toolkit is not resolvable.
 
 If you are here to merge the two implementations, the correct change is
 usually none. If the shared logic genuinely needs to move, extract it into a
@@ -52,9 +51,9 @@ the installed package.
 
 Deliberate omission: there is no retry/backoff here (the toolkit has
 _search_with_retry). A diagnostic tool should surface the raw failure rather
-than mask it behind retries. If this script is ever promoted from "fallback
-and diagnostic" to "general executor", revisit that decision explicitly rather
-than adding retries by reflex.
+than mask it behind retries. If this script is ever promoted from "direct
+browser diagnostic" to "general executor", revisit that decision explicitly
+rather than adding retries by reflex.
 --------------------------------------------------------------------------
 """
 
@@ -66,9 +65,42 @@ import sys
 import re
 
 WEBBRIDGE_URL = "http://127.0.0.1:10086/command"
-# Prefer one task-specific session per run; keep the legacy default for callers
-# that have not adopted WEBBRIDGE_SESSION yet.
-SESSION = os.environ.get("WEBBRIDGE_SESSION", "perplexity-search")
+# Prefer one task-specific session per run. Set WEBBRIDGE_SESSION when several
+# processes must continue the same authorized browser task.
+SESSION = os.environ.get("WEBBRIDGE_SESSION", f"perplexity-web-{os.getpid()}")
+
+_GROUNDING_REQUIREMENTS = """Requirements:
+1. Cite sources with URLs
+2. If no verified source, say so
+3. For pricing: official page URLs only
+4. Format as comparison table with Source URL column"""
+
+
+def build_grounded_query(query):
+    """Apply the shared source-grounding wrapper exactly once."""
+    if "requirements:" in query.casefold() or "要求：" in query or "要求:" in query:
+        return query
+    return f"{query.rstrip()}\n{_GROUNDING_REQUIREMENTS}"
+
+
+def _result(error=None, **fields):
+    result = {
+        "answer": None,
+        "sources": [],
+        "url": "",
+        "title": "",
+        "follow_ups": [],
+        "session": SESSION,
+        "verification": {
+            "state": "unverified",
+            "claim_support": "not_evaluated",
+            "source_check": {},
+        },
+    }
+    if error:
+        result["error"] = error
+    result.update(fields)
+    return result
 
 
 def wb(action, args=None):
@@ -82,6 +114,8 @@ def wb(action, args=None):
          "-d", json.dumps(payload)],
         capture_output=True, text=True, timeout=30
     )
+    if result.returncode != 0:
+        return {"error": f"curl failed with exit code {result.returncode}"}
     try:
         return json.loads(result.stdout)
     except Exception:
@@ -150,7 +184,7 @@ def find_button_ref(button_text):
     return None
 
 
-def perplexity_search(query, wait_seconds=15, expand=True, new_tab=True):
+def perplexity_search(query, wait_seconds=15, expand=True, new_tab=None):
     """
     Search Perplexity AI and extract results.
     
@@ -158,7 +192,8 @@ def perplexity_search(query, wait_seconds=15, expand=True, new_tab=True):
         query: Search query string
         wait_seconds: How long to wait for answer generation
         expand: Whether to click "查看更多" to expand full answer
-        new_tab: Whether to open in a new tab
+        new_tab: Whether to open in a new tab. If omitted, open one tab only
+                 for an empty session and reuse the current tab thereafter.
     
     Returns:
         dict with: answer, sources, url, title, follow_ups
@@ -169,53 +204,49 @@ def perplexity_search(query, wait_seconds=15, expand=True, new_tab=True):
     tabs_resp = wb("list_tabs", {})
     tabs_text = json.dumps(tabs_resp, ensure_ascii=False).lower()
     if "no extension connected" in tabs_text:
-        return {
-            "error": "WebBridge has no extension connection: " + str(tabs_resp),
-            "answer": None,
-            "sources": [],
-            "url": "",
-            "title": "",
-            "follow_ups": []
-        }
+        return _result("WebBridge has no extension connection: " + str(tabs_resp))
     if not tabs_resp.get("success"):
-        return {
-            "error": "list_tabs precheck failed: " + str(tabs_resp),
-            "answer": None,
-            "sources": [],
-            "url": "",
-            "title": "",
-            "follow_ups": []
-        }
+        return _result("list_tabs precheck failed: " + str(tabs_resp))
+    if "tabs" not in tabs_resp:
+        return _result("list_tabs precheck omitted the tabs field")
+
+    if new_tab is None:
+        new_tab = not bool(tabs_resp.get("tabs"))
 
     # 1. Navigate to Perplexity
-    wb("navigate", {
+    navigate_resp = wb("navigate", {
         "url": "https://www.perplexity.ai",
         "newTab": new_tab,
         "group_title": f"Perplexity: {query[:50]}"
     })
+    if not navigate_resp.get("success"):
+        return _result("navigate failed: " + str(navigate_resp))
     time.sleep(4)
+
+    # Read back the session after navigation so a successful HTTP response is
+    # not mistaken for a tab that actually exists.
+    after_nav = wb("list_tabs", {})
+    if not after_nav.get("success"):
+        return _result("post-navigation list_tabs failed: " + str(after_nav))
+    if "tabs" not in after_nav:
+        return _result("post-navigation list_tabs omitted the tabs field")
+    tab_count = len(after_nav.get("tabs", []))
     
     # 2. Find textbox ref via snapshot
     textbox_ref = find_textbox_ref()
     if not textbox_ref:
-        return {
-            "error": "Could not find input textbox",
-            "answer": None,
-            "sources": [],
-            "url": "",
-            "title": "",
-            "follow_ups": []
-        }
+        return _result("Could not find input textbox")
     
     # 3. Click textbox to focus it (REQUIRED before fill)
     wb("click", {"selector": textbox_ref})
     time.sleep(0.5)
     
     # 4. Fill query
-    fill_resp = wb("fill", {"selector": textbox_ref, "value": query})
+    grounded_query = build_grounded_query(query)
+    fill_resp = wb("fill", {"selector": textbox_ref, "value": grounded_query})
     if not fill_resp.get("data", {}).get("success"):
         # Fallback: use CDP insertText
-        wb("cdp", {"method": "Input.insertText", "params": {"text": query}})
+        wb("cdp", {"method": "Input.insertText", "params": {"text": grounded_query}})
     time.sleep(0.5)
     
     # 5. Submit via Enter key (three-event combo: beforeinput + keydown + keyup)
@@ -248,14 +279,11 @@ def perplexity_search(query, wait_seconds=15, expand=True, new_tab=True):
     title = page_info.get("title", "") if isinstance(page_info, dict) else ""
     
     if "/search/" not in url:
-        return {
-            "error": "Search did not trigger (stayed on homepage)",
-            "answer": None,
-            "sources": [],
-            "url": url,
-            "title": title,
-            "follow_ups": []
-        }
+        return _result(
+            "Search did not trigger (stayed on homepage)",
+            url=url,
+            title=title,
+        )
     
     # 8. Expand answer if collapsed (click "查看更多")
     if expand:
@@ -344,7 +372,14 @@ def perplexity_search(query, wait_seconds=15, expand=True, new_tab=True):
         "sources": sources,
         "url": url,
         "title": title,
-        "follow_ups": follow_ups
+        "follow_ups": follow_ups,
+        "session": SESSION,
+        "tab_count": tab_count,
+        "verification": {
+            "state": "unverified",
+            "claim_support": "not_evaluated",
+            "source_check": {},
+        },
     }
 
 

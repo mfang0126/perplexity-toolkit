@@ -25,6 +25,17 @@ pipx install git+https://github.com/mfang0126/perplexity-toolkit.git
 # Single search
 perplexity search "best AI coding agents 2026"
 
+# Keep several CLI commands in one task session; this global option comes
+# before the subcommand.
+perplexity --session-prefix coding-agents-2026 search "best AI coding agents 2026"
+
+# Skip the default quality/readback annotation only when explicitly needed.
+perplexity --no-verify search "best AI coding agents 2026"
+
+# Classify the original user wording before selecting CLI or direct browser.
+# This command is local; it does not open Chrome or call Perplexity.
+perplexity route -f json "Please use Perplexity in Chrome"
+
 # Deep Research (multi-step, 60-120s)
 perplexity search "AI safety risks 2026" -m deep_research
 
@@ -34,6 +45,12 @@ perplexity batch -i queries.json -o results.json
 # Aggregate results
 perplexity aggregate results.json -f markdown
 ```
+
+Search output is quality-annotated by default. A JSON search result is always
+one JSON document on stdout; human-readable quality text is not appended to
+`-f json`. The quality block distinguishes HTTP reachability from bounded page
+readback and reports `verification_state: candidate` / `claim_support:
+not_evaluated` until a human or semantic evidence pass confirms each claim.
 
 ## Python API
 
@@ -101,6 +118,8 @@ from perplexity_toolkit.drivers.base import BrowserDriver
 
 class PlaywrightDriver(BrowserDriver):
     def navigate(self, url, new_tab=True, group_title=""): ...
+    # Optional session hygiene hook; unsupported drivers may omit it.
+    def list_tabs(self): ...
     def snapshot(self): ...
     def click(self, selector): ...
     def fill(self, selector, value): ...
@@ -194,6 +213,12 @@ pipx install git+https://github.com/mfang0126/perplexity-toolkit.git
 # 单次搜索
 perplexity search "2026 年最好的 AI 编程助手"
 
+# 多条 CLI 命令共用同一个任务 session；全局选项必须放在子命令前
+perplexity --session-prefix coding-agents-2026 search "2026 年最好的 AI 编程助手"
+
+# 仅在明确需要时跳过默认质量/readback 标注
+perplexity --no-verify search "2026 年最好的 AI 编程助手"
+
 # 深度研究（多步推理，约 60–120 秒）
 perplexity search "2026 年 AI 安全风险" -m deep_research
 
@@ -206,6 +231,11 @@ perplexity aggregate results.json -f markdown
 # 查看搜索历史
 perplexity history
 ```
+
+搜索默认会附加质量检查。JSON 输出始终是 stdout 上的单个 JSON 文档，
+不会再混入人类可读的质量文本。质量结果区分 HTTP 可达性和有界页面
+readback，并在逐条 claim 经过人工或语义证据核验前标记为
+`verification_state: candidate`、`claim_support: not_evaluated`。
 
 ## CLI 命令一览
 
@@ -281,6 +311,8 @@ from perplexity_toolkit.drivers.base import BrowserDriver
 
 class PlaywrightDriver(BrowserDriver):
     def navigate(self, url, new_tab=True, group_title=""): ...
+    # Optional session hygiene hook; unsupported drivers may omit it.
+    def list_tabs(self): ...
     def snapshot(self): ...
     def click(self, selector): ...
     def fill(self, selector, value): ...

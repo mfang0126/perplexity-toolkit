@@ -95,6 +95,10 @@ class WebBridgeDriver(BrowserDriver):
                 result = self._send("navigate", args)
         return result
 
+    def list_tabs(self) -> dict:
+        """Check the WebBridge connection and list tabs in this session."""
+        return self._send("list_tabs", {})
+
     def snapshot(self) -> dict:
         return self._send("snapshot", {})
 

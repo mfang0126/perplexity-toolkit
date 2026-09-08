@@ -6,8 +6,22 @@ import json
 import sys
 
 from ..config import set_config
+from ..routing import select_route
 
 logger = logging.getLogger(__name__)
+
+
+def cmd_route(args) -> int:
+    """Select a route from the original user wording only."""
+    decision = select_route(args.request)
+    if args.format == "json":
+        print(json.dumps(decision, ensure_ascii=False))
+    else:
+        print(f"route: {decision['route']}")
+        if decision["matched_terms"]:
+            print("matched_terms: " + ", ".join(decision["matched_terms"]))
+        print("reason: " + decision["reason"])
+    return 0
 
 
 def cmd_search(args):
@@ -16,7 +30,7 @@ def cmd_search(args):
     modes = {"search": search, "deep_research": deep_research,
              "model_council": model_council, "step_by_step": step_by_step}
     fn = modes.get(args.mode, search)
-    result = fn(args.query)
+    result = fn(args.query, new_tab=None, verify=args.verify)
     if args.format == "json":
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
@@ -26,21 +40,24 @@ def cmd_search(args):
         for i, s in enumerate(result.get("sources", []), 1):
             print(f"  {i}. {s.get('text', '')[:80]} → {s.get('href', '')}")
 
-    # Show verification results if available
-    quality = result.get("quality")
-    if quality:
-        print(f"\n--- Quality Check ---")
-        ac = quality.get("answer_check", {})
-        sc = quality.get("source_check", {})
-        print(f"Answer score: {ac.get('score', '?')}/100")
-        if ac.get("issues"):
-            for issue in ac["issues"]:
-                print(f"  ⚠ {issue}")
-        if sc.get("total", 0) > 0:
-            print(f"Sources: {sc['valid']}/{sc['total']} reachable")
-            for b in sc.get("broken_urls", []):
-                print(f"  ✗ [{b['status']}] {b['href']}")
-        print(f"Verdict: {quality.get('verdict', '?')} — {quality.get('suggestion', '')}")
+        # Show verification results only in human-readable mode. JSON mode
+        # must remain one valid JSON document on stdout.
+        quality = result.get("quality")
+        if quality:
+            print(f"\n--- Quality Check ---")
+            ac = quality.get("answer_check", {})
+            sc = quality.get("source_check", {})
+            print(f"Answer score: {ac.get('score', '?')}/100")
+            if ac.get("issues"):
+                for issue in ac["issues"]:
+                    print(f"  ⚠ {issue}")
+            if sc.get("total", 0) > 0:
+                print(f"Sources: {sc['valid']}/{sc['total']} reachable")
+                for b in sc.get("broken_urls", []):
+                    print(f"  ✗ [{b['status']}] {b['href']}")
+            print(f"Verdict: {quality.get('verdict', '?')} — {quality.get('suggestion', '')}")
+
+    return 1 if result.get("error") else 0
 
 
 def cmd_batch(args):
@@ -56,7 +73,7 @@ def cmd_batch(args):
         sys.exit(1)
     run_batch(queries, output_file=args.output, resume=args.resume,
               progress_file=args.progress if args.resume else None,
-              delay=args.delay)
+              delay=args.delay, verify=args.verify)
 
 
 def cmd_aggregate(args):
@@ -127,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-w", "--wait", type=float, help="Search wait time (seconds)")
     parser.add_argument("-r", "--retries", type=int, help="Max retries")
+    parser.add_argument("--session-prefix", help="Task-scoped WebBridge session prefix")
     # Choices come from the registry so this flag can never advertise a backend
     # that is not actually implemented, and an unknown value is rejected here
     # rather than silently falling back to webbridge.
@@ -134,7 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-b", "--backend", choices=backends,
         help=f"Driver backend ({', '.join(backends)})",
     )
-    parser.add_argument("--verify", action="store_true", help="Verify sources and answer quality")
+    parser.set_defaults(verify=True)
+    parser.add_argument("--verify", dest="verify", action="store_true",
+                        help="Verify sources and answer quality (default)")
+    parser.add_argument("--no-verify", dest="verify", action="store_false",
+                        help="Skip source and answer-quality verification")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging")
     sub = parser.add_subparsers(dest="command")
 
@@ -144,6 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", "--mode", default="search",
                    choices=["search", "deep_research", "model_council", "step_by_step"])
     p.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    p.add_argument("--verify", dest="verify", action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--no-verify", dest="verify", action="store_false", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
 
     # batch
     p = sub.add_parser("batch", help="Batch search")
@@ -154,6 +180,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-r", "--resume", action="store_true")
     p.add_argument("--progress", default=".batch_progress")
     p.add_argument("-d", "--delay", type=float, default=3.0)
+    p.add_argument("--verify", dest="verify", action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--no-verify", dest="verify", action="store_false", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
 
     # aggregate
     p = sub.add_parser("aggregate", help="Aggregate results")
@@ -169,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
     p.add_argument("--href", nargs="*", help="Specific conversation UUIDs to delete")
 
+    # route
+    p = sub.add_parser("route", help="Select CLI or direct-browser route")
+    p.add_argument("request", help="Original user wording, not a search query")
+    p.add_argument("-f", "--format", default="json", choices=["json", "text"])
+
     return parser
 
 
@@ -183,6 +218,8 @@ def main():
         cfg_overrides["max_retries"] = args.retries
     if args.backend:
         cfg_overrides["driver_backend"] = args.backend
+    if args.session_prefix:
+        cfg_overrides["session_prefix"] = args.session_prefix
     if cfg_overrides:
         set_config(**cfg_overrides)
 
@@ -190,8 +227,10 @@ def main():
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(name)s %(levelname)s: %(message)s")
 
-    if args.command == "search":
-        cmd_search(args)
+    if args.command == "route":
+        return cmd_route(args)
+    elif args.command == "search":
+        return cmd_search(args)
     elif args.command == "batch":
         cmd_batch(args)
     elif args.command == "aggregate":
@@ -200,7 +239,8 @@ def main():
         cmd_history(args)
     else:
         parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

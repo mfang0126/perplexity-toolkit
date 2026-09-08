@@ -3,13 +3,35 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.1.1"
-  requires: ["kimi-webbridge"]
+  version: "0.1.2"
+  requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 
 # Perplexity Web Automation Skill
 
 Automate search and extraction from Perplexity AI (Pro account) via Kimi WebBridge browser control.
+
+## Route boundary
+
+This is the direct-browser execution layer, not the default Perplexity route.
+Use it when the user explicitly requests a web page, browser, Chrome, WebBridge,
+Kimi WebBridge, opening Perplexity, or continuing the current browser thread.
+For an ordinary Perplexity request without that wording, the high-level policy
+uses the `perplexity` CLI first. Do not invoke the CLI first when this direct
+browser route is explicitly selected.
+
+The global `browser-routing` skill remains the browser decision layer. For a
+Perplexity direct-browser request it selects `kimi-webbridge`; load
+`webbridge-hygiene` with it. This skill is the Perplexity-specific domain
+adapter on top of that generic browser driver.
+
+## Named-model verification
+
+A workflow mode is not a named model. If the user asks for K3 or another
+specific model, select it through the visible Perplexity model control and read
+back the label after selection. Return `selected_model` and
+`model_label_verified: true` only when the label is actually visible; otherwise
+stop with an unverified result and do not infer the model from answer style.
 
 ## Prerequisites
 
