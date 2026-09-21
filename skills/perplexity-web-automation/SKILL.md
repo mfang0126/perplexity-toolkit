@@ -184,6 +184,25 @@ perplexity console threads                                             # recorde
 perplexity console selfcheck                                           # canned full-gate run
 ```
 
+Granular steps (intent composition — added 2026-09-21). The composite `ask` and the step commands share ONE implementation per step; each step is also callable alone and composes through a staged-turn ledger (`state.json → pending`):
+
+```bash
+perplexity console open <task|url> [--new-thread]                # re-attach / switch threads
+perplexity console fill "q" [--task T] [--new-thread] [--file F] # stage: attach + fill + verify (no send)
+perplexity console submit                                        # submit the staged turn (verified, self-healing)
+perplexity console wait [--wait N]                               # wait for the staged answer to settle
+perplexity console extract                                       # turn-scoped answer (+sources); consumes the staged turn
+perplexity console send "q" [--file F]                           # fill + submit only
+perplexity console attach --file F | files | detach NAME         # attachment management (idempotent)
+```
+
+Recovery cookbook by error code (all commands print `error_code` in JSON):
+- `pending.missing` → nothing staged: run `fill` first. `pending.stale` (>30 min) → re-`fill`. `pending.page-moved` → tab wandered: `console open <task>` then re-`fill`. `pending.not-submitted` → `wait` needs `submit` first.
+- `fill.not-committed` → editor desynced; the step already tried one reload — re-run `fill` once, then read the evidence screenshot.
+- `submit.no-turn` → check the error's last-bubble hint; if a mis-sent turn exists, `console open` (reload) then re-`fill`/`submit`.
+- `complete.timeout` → answer didn't settle in budget: `wait --wait <bigger>` (deep answers run minutes) or `extract` what's there.
+- Default practice: ordinary turn → `ask`; anything unusual (partial flows, single-step retries, staged attachments, inspection between steps) → compose the granular steps.
+
 Conventions: WebBridge session `perplexity-console`, group «Perplexity 控制台», exactly one tab. Durable state lives in `~/.perplexity-console/state.json` (session, group, per-task thread URL) because session→tab mappings are daemon-memory only and die on daemon restart — the console attach-or-recreates by reopening the saved thread URL. Every step carries a readback gate; failures raise with a screenshot under `~/.perplexity-console/evidence/`.
 
 Live-verified UI behaviors (2026-09; bake these into any direct-browser flow):

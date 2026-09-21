@@ -25,13 +25,21 @@ from perplexity_toolkit.console import (
     BASE_URL,
     ConsoleError,
     _bubble_owns,
+    _now_iso,
     _url_matches,
     console_ask,
+    console_attach,
+    console_detach,
+    console_extract,
+    console_fill,
     console_models,
     console_selfcheck,
+    console_send,
     console_set_model,
     console_status,
+    console_submit,
     console_threads,
+    console_wait,
     load_state,
     save_state,
 )
@@ -229,6 +237,14 @@ class ConsoleFakeDriver(BrowserDriver):
                      "x": 780, "y": 600 + i * 36, "vis": True}
                     for i, (n, sub) in enumerate(self.model_rows)]
             return {"open": True, "rows": rows}
+        if "removeBtn" in code:
+            m = re.search(r'===\s*("(?:[^"\\]|\\.)*")', code)
+            label = json.loads(m.group(1)) if m else ""
+            name = label[3:] if label.startswith("移除 ") else label
+            if name in self.attachments:
+                self.attachments.remove(name)
+                return "clicked"
+            return "not-found"
         if "移除 " in code:
             return {"attachments": list(self.attachments)}
         if "aria-haspopup" in code:
@@ -505,6 +521,7 @@ class TestSelfcheckAndStatus:
         st = console_status(config=make_config(), driver=drv)
         assert st["live"]["tabs"] == 1
         assert st["live"]["on_thread"] is False
+        assert st["pending"] is None
         assert console_threads()["threads"] == {}
 
 
@@ -615,3 +632,122 @@ class TestAskFiles:
         assert res["ok"]
         assert res["answer"] == "答案 42。"  # NOT the stale 旧答案
         assert res["gates"]["complete"]["new_seen"] is True
+
+
+class TestGranularFlow:
+    """Intent composition: fill → submit → wait → extract through the
+    staged-turn ledger, one independent command per step."""
+
+    def _seed_thread_state(self):
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 0,
+        }
+        save_state(state)
+
+    def test_fill_submit_wait_extract_cycle(self, tmp_path):
+        f = tmp_path / "console-attach-test.txt"
+        f.write_text("42", encoding="utf-8")
+        self._seed_thread_state()
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        drv.bubbles = ["旧问题\n13:39"]
+        drv.prose = ["旧答案"]
+        drv.studied = 1
+
+        r1 = console_fill("数字是多少", files=[str(f)],
+                          config=make_config(), driver=drv, sleep=NOOP)
+        assert r1["pending"]["query"] == "数字是多少"
+        assert r1["pending"]["files"] == ["console-attach-test.txt"]
+        assert load_state()["pending"]["status"] == "filled"
+
+        r2 = console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                            submit_timeout=0.4, submit_recheck_timeout=0.1,
+                            poll_interval=0.01)
+        assert r2["gates"]["submit"]["ok"]
+        assert load_state()["pending"]["status"] == "submitted"
+
+        r3 = console_wait(config=make_config(), driver=drv, sleep=NOOP,
+                          wait_budget=1.0, poll_interval=0.01)
+        assert r3["gates"]["complete"]["ok"]
+
+        r4 = console_extract(config=make_config(), driver=drv, sleep=NOOP)
+        assert r4["answer"] == "答案 42。"
+        st = load_state()
+        assert not st.get("pending")
+        assert st["threads"]["default"]["turns"] == 1
+
+    def test_submit_without_pending_raises(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        with pytest.raises(ConsoleError) as ei:
+            console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        assert ei.value.code == "pending.missing"
+
+    def test_wait_before_submit_raises(self):
+        state = load_state()
+        state["pending"] = {
+            "task": "default", "query": "q", "files": [], "file_paths": [],
+            "url": "https://www.perplexity.ai/search/x",
+            "base_bubbles": 0, "base_studied": 0, "base_prose_count": 0,
+            "filled_at": _now_iso(), "status": "filled", "new_thread": False,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True, url="https://www.perplexity.ai/search/x")
+        with pytest.raises(ConsoleError) as ei:
+            console_wait(config=make_config(), driver=drv, sleep=NOOP)
+        assert ei.value.code == "pending.not-submitted"
+
+    def test_stale_pending_rejected(self):
+        state = load_state()
+        state["pending"] = {
+            "task": "default", "query": "q", "files": [], "file_paths": [],
+            "url": "https://www.perplexity.ai/search/x",
+            "base_bubbles": 0, "base_studied": 0, "base_prose_count": 0,
+            "filled_at": "2020-01-01T00:00:00Z", "status": "filled", "new_thread": False,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True, url="https://www.perplexity.ai/search/x")
+        with pytest.raises(ConsoleError) as ei:
+            console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        assert ei.value.code == "pending.stale"
+
+    def test_submit_page_moved_rejected(self):
+        state = load_state()
+        state["pending"] = {
+            "task": "default", "query": "q", "files": [], "file_paths": [],
+            "url": "https://www.perplexity.ai/search/thread-A",
+            "base_bubbles": 0, "base_studied": 0, "base_prose_count": 0,
+            "filled_at": _now_iso(), "status": "filled", "new_thread": False,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/thread-B")
+        with pytest.raises(ConsoleError) as ei:
+            console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        assert ei.value.code == "pending.page-moved"
+
+    def test_attach_idempotent_and_detach(self, tmp_path):
+        f = tmp_path / "console-attach-test.txt"
+        f.write_text("42", encoding="utf-8")
+        drv = ConsoleFakeDriver(share_tab=True)
+        r1 = console_attach([str(f)], config=make_config(), driver=drv, sleep=NOOP)
+        assert "console-attach-test.txt" in r1["pending_files"]
+        console_attach([str(f)], config=make_config(), driver=drv, sleep=NOOP)
+        assert drv.attachments == ["console-attach-test.txt"]  # idempotent
+        r3 = console_detach("console-attach-test.txt", config=make_config(),
+                            driver=drv, sleep=NOOP)
+        assert r3["chips"] == []
+        assert drv.attachments == []
+        assert not (load_state().get("pending") or {}).get("files")
+
+    def test_send_composes_fill_and_submit(self):
+        self._seed_thread_state()
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        r = console_send("q-send", config=make_config(), driver=drv, sleep=NOOP,
+                         submit_timeout=0.4, submit_recheck_timeout=0.1,
+                         poll_interval=0.01)
+        assert r["ok"] and r["gates"]["submit"]["ok"]
+        assert load_state()["pending"]["status"] == "submitted"

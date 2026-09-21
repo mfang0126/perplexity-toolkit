@@ -206,16 +206,20 @@ _JS_INJECT_FILE = r"""(() => {
 # ──────────────────────────────────────────────────────────────
 
 class ConsoleError(RuntimeError):
-    """A console gate failed. Carries the gate name and evidence path."""
+    """A console gate failed. Carries the gate name, evidence path and a
+    machine-readable error code so callers (intent layer) can pick a
+    recovery recipe per failure class."""
 
     def __init__(self, gate: str, message: str, *,
                  gates: Optional[dict] = None,
-                 evidence: Optional[str] = None):
+                 evidence: Optional[str] = None,
+                 code: Optional[str] = None):
         super().__init__(f"[{gate}] {message}")
         self.gate = gate
         self.message = message
         self.gates = gates or {}
         self.evidence = evidence
+        self.code = code
 
 
 # ──────────────────────────────────────────────────────────────
@@ -238,6 +242,7 @@ def _default_state() -> dict:
         "group_title": DEFAULT_GROUP_TITLE,
         "active_task": None,
         "threads": {},
+        "pending": None,
     }
 
 
@@ -250,7 +255,7 @@ def load_state() -> dict:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return state
     if isinstance(data, dict):
-        for key in ("version", "session", "group_title", "active_task"):
+        for key in ("version", "session", "group_title", "active_task", "pending"):
             if key in data:
                 state[key] = data[key]
         if isinstance(data.get("threads"), dict):
@@ -265,6 +270,80 @@ def save_state(state: dict) -> None:
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+# ──────────────────────────────────────────────────────────────
+# Staged turn ("pending") ledger
+#
+# Granular commands (fill → submit → wait → extract) compose through this
+# record: fill stages it with the pre-submit baselines, submit/wait/extract
+# consume it. It is what makes step-by-step intent-driven use safe — each
+# step knows exactly which turn it belongs to.
+# ──────────────────────────────────────────────────────────────
+
+PENDING_TTL = 1800.0  # seconds a staged turn stays valid
+
+
+def _pending(state: dict) -> dict:
+    p = state.get("pending")
+    return p if isinstance(p, dict) else {}
+
+
+def _pending_age_seconds(p: dict) -> float:
+    ts = p.get("filled_at")
+    if not ts:
+        return 0.0
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+    except ValueError:
+        return 0.0
+
+
+def _pending_require(state: dict, *, stage: str) -> dict:
+    p = _pending(state)
+    if not p or not p.get("query"):
+        raise ConsoleError(
+            "pending",
+            f"no staged turn for `{stage}`; run `perplexity console fill \"...\"` first",
+            code="pending.missing")
+    if stage in ("submit", "wait") and _pending_age_seconds(p) > PENDING_TTL:
+        raise ConsoleError(
+            "pending",
+            f"staged turn is stale (>{int(PENDING_TTL / 60)} min old); re-run `console fill`",
+            code="pending.stale")
+    if stage == "submit" and p.get("submitted_at"):
+        raise ConsoleError(
+            "pending",
+            "this turn was already submitted; use `console wait` / `console extract`, "
+            "or `console fill` to stage a new turn",
+            code="pending.already-submitted")
+    if stage == "wait" and not p.get("submitted_at"):
+        raise ConsoleError(
+            "pending",
+            "turn not submitted yet; run `console submit` first",
+            code="pending.not-submitted")
+    return p
+
+
+def _log_run(op: str, *, ok: bool = True, gate: Optional[str] = None,
+             url: Optional[str] = None, elapsed: Optional[float] = None) -> None:
+    """Append one compact line to runs.jsonl (best-effort observability)."""
+    try:
+        path = console_home() / "runs.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec: dict = {"ts": _now_iso(), "op": op, "ok": bool(ok)}
+        if gate:
+            rec["gate"] = gate
+        if url:
+            rec["url"] = url
+        if elapsed is not None:
+            rec["elapsed_s"] = round(elapsed, 1)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 # ──────────────────────────────────────────────────────────────
@@ -343,15 +422,18 @@ def _tabs(driver: Any) -> list:
     """Session tabs via list_tabs, or ConsoleError on bridge failure."""
     resp = driver.list_tabs()
     if not isinstance(resp, dict):
-        raise ConsoleError("attach", f"list_tabs returned {type(resp).__name__}")
+        raise ConsoleError("attach", f"list_tabs returned {type(resp).__name__}",
+                           code="attach.bad-response")
     blob = json.dumps(resp, ensure_ascii=False).lower()
     if "no extension connected" in blob:
-        raise ConsoleError("attach", "WebBridge extension is not connected")
+        raise ConsoleError("attach", "WebBridge extension is not connected",
+                           code="attach.disconnected")
     data = resp.get("data")
     if not isinstance(data, dict):
         data = {}
     if resp.get("ok") is False or data.get("success") is False or resp.get("error"):
-        raise ConsoleError("attach", f"list_tabs failed: {resp.get('error') or resp}")
+        raise ConsoleError("attach", f"list_tabs failed: {resp.get('error') or resp}",
+                           code="attach.bad-response")
     tabs = data.get("tabs")
     return tabs if isinstance(tabs, list) else []
 
@@ -417,7 +499,8 @@ def attach(driver: Any, state: dict, target_url: str, *,
         sleep(cfg.page_load_wait)
         created = True
         if not _tabs(driver):
-            raise ConsoleError("attach", "navigate did not create a session tab")
+            raise ConsoleError("attach", "navigate did not create a session tab",
+                               code="attach.no-tab")
         return {"created": created, "tab_count": 1, "url": target_url}
 
     current = (_info(driver).get("url") or "")
@@ -427,7 +510,8 @@ def attach(driver: Any, state: dict, target_url: str, *,
         current = (_info(driver).get("url") or "")
         if not _url_matches(current, target_url):
             raise ConsoleError(
-                "attach", f"tab did not reach {target_url!r} (at {current!r})")
+                "attach", f"tab did not reach {target_url!r} (at {current!r})",
+                code="attach.navigate")
     return {"created": created, "tab_count": len(_tabs(driver)), "url": current}
 
 
@@ -490,7 +574,7 @@ def _gate_fill(driver: Any, query: str, *, sleep: Callable[[float], None],
         "fill",
         f"composer/editor state never committed (left={detail.get('last_after', '')!r}, "
         f"btn={detail['tries'][-1].get('btn')!r})",
-        evidence=_evidence(driver))
+        evidence=_evidence(driver), code="fill.not-committed")
 
 
 def _composer(driver: Any) -> str:
@@ -568,7 +652,7 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
     raise ConsoleError(
         "submit",
         f"no new user turn observed after submit attempts (last bubble: {str(last)[:80]!r})",
-        evidence=_evidence(driver))
+        evidence=_evidence(driver), code="submit.no-turn")
 
 
 def _gate_complete(driver: Any, base_studied: int, *,
@@ -614,7 +698,7 @@ def _gate_complete(driver: Any, base_studied: int, *,
         raise ConsoleError(
             "complete",
             f"new turn's answer never settled (new_seen={new_seen}, method={method})",
-            gates={"complete": result})
+            gates={"complete": result}, code="complete.timeout")
     return result
 
 
@@ -640,7 +724,8 @@ def _open_model_menu(driver: Any, *, sleep: Callable[[float], None],
     """
     button = _model_button(driver)
     if not button.get("found"):
-        raise ConsoleError("model", "model selector button not found in the composer")
+        raise ConsoleError("model", "model selector button not found in the composer",
+                           code="model.no-button")
     menu = _js(driver, _JS_MODEL_MENU, {})
     for _ in range(attempts):
         if isinstance(menu, dict) and menu.get("open"):
@@ -649,7 +734,8 @@ def _open_model_menu(driver: Any, *, sleep: Callable[[float], None],
         sleep(1.2)
         menu = _js(driver, _JS_MODEL_MENU, {})
     if not isinstance(menu, dict) or not menu.get("open"):
-        raise ConsoleError("model", "model menu did not open after CDP clicks")
+        raise ConsoleError("model", "model menu did not open after CDP clicks",
+                           code="model.menu-failed")
     return {"button": button, "rows": menu.get("rows") or []}
 
 
@@ -717,10 +803,12 @@ def console_set_model(name: str, *, config: Optional[Config] = None, driver: Any
     if row is None:
         available = ", ".join(r.get("name", "?") for r in opened["rows"])
         _close_model_menu(drv, sleep=sleep)
-        raise ConsoleError("model", f"model {name!r} not found; available: {available}")
+        raise ConsoleError("model", f"model {name!r} not found; available: {available}",
+                           code="model.not-found")
     if row.get("submenu"):
         _close_model_menu(drv, sleep=sleep)
-        raise ConsoleError("model", f"{row.get('name')!r} is a submenu entry (not supported yet)")
+        raise ConsoleError("model", f"{row.get('name')!r} is a submenu entry (not supported yet)",
+                           code="model.submenu")
 
     label = ""
     for attempt in (1, 2):
@@ -734,7 +822,7 @@ def console_set_model(name: str, *, config: Optional[Config] = None, driver: Any
             opened = _open_model_menu(drv, sleep=sleep)
             row = find_row(opened["rows"]) or row
     raise ConsoleError("model", f"switch to {name!r} not verified (selector shows {label!r})",
-                       evidence=_evidence(drv))
+                       evidence=_evidence(drv), code="model.verify-failed")
 
 
 MAX_INJECT_BYTES = 8 * 1024 * 1024  # larger files need the chrome://extensions file-access route
@@ -749,13 +837,14 @@ def _inject_file(driver: Any, path: str) -> dict:
     """
     p = Path(path).expanduser()
     if not p.is_file():
-        raise ConsoleError("file", f"file not found: {path}")
+        raise ConsoleError("file", f"file not found: {path}", code="file.not-found")
     data = p.read_bytes()
     if len(data) > MAX_INJECT_BYTES:
         raise ConsoleError(
             "file",
             f"{p.name} is {len(data)} bytes; in-page injection limit is {MAX_INJECT_BYTES} bytes "
-            "(for larger files enable 'Allow access to file URLs' for the Kimi extension)")
+            "(for larger files enable 'Allow access to file URLs' for the Kimi extension)",
+            code="file.too-large")
     mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
     code = (_JS_INJECT_FILE
             .replace("__B64__", json.dumps(base64.b64encode(data).decode("ascii")))
@@ -763,14 +852,29 @@ def _inject_file(driver: Any, path: str) -> dict:
             .replace("__MIME__", json.dumps(mime)))
     res = _js(driver, code, {})
     if not isinstance(res, dict) or not res.get("ok"):
-        raise ConsoleError("file", f"injection failed for {p.name}: {res}")
+        raise ConsoleError("file", f"injection failed for {p.name}: {res}",
+                           code="file.inject-failed")
     return {"name": p.name, "size": len(data), "mime": mime}
 
 
 def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
                 wait: float = 30.0, poll: float = 1.0) -> dict:
-    """Gate: every requested file must be injected AND shown as a chip."""
-    injected = [_inject_file(driver, f) for f in files]
+    """Gate: every requested file must be attached AND shown as a chip.
+
+    Idempotent: files already present as chips are skipped, so injecting the
+    same set twice (e.g. attach-then-fill, or a recovery re-run) never
+    duplicates attachments.
+    """
+    chips0 = _js(driver, _JS_CHIPS, {})
+    current = chips0.get("attachments") if isinstance(chips0, dict) else []
+    injected = []
+    for f in files:
+        name = Path(f).expanduser().name
+        if name in (current or []):
+            injected.append({"name": name, "size": None, "mime": None,
+                             "already_attached": True})
+            continue
+        injected.append(_inject_file(driver, f))
     names = [i["name"] for i in injected]
     deadline = time.monotonic() + wait
     chips: Any = []
@@ -781,38 +885,19 @@ def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
             break
         if time.monotonic() >= deadline:
             raise ConsoleError("file", f"attachment chips not verified for {names} (saw {chips})",
-                               evidence=_evidence(driver))
+                               evidence=_evidence(driver), code="file.chip-missing")
         sleep(max(poll, 0.05))
     # let the app finish processing the fresh upload before any composer work
     sleep(2.5)
     return {"ok": True, "injected": injected, "chips": chips}
 
 
-def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
-                files: Optional[list] = None,
-                wait_budget: float = DEFAULT_WAIT, poll_interval: float = POLL_INTERVAL,
-                submit_timeout: float = SUBMIT_TIMEOUT,
-                submit_recheck_timeout: float = 6.0,
-                config: Optional[Config] = None, driver: Any = None,
-                sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Ask the resident console one question, with every step verified.
-
-    Continuation model: one task = one Perplexity thread. Without
-    ``new_thread`` an existing thread for ``task`` is continued as a
-    follow-up; otherwise a new thread is started in the same tab.
-    """
-    cfg = config or get_config()
-    state = load_state()
-    drv = driver or _make_driver(cfg, state)
-    gates: dict = {}
-    started = time.monotonic()
-
+def _ensure_task_context(drv: Any, state: dict, *, task: str, new_thread: bool,
+                         cfg: Config, sleep: Callable[[float], None]) -> dict:
+    """Attach to the task's thread (or home for a new thread) and verify."""
     thread = state["threads"].get(task) or {}
-    target = thread.get("url") or BASE_URL
-    if new_thread:
-        target = BASE_URL
-    gates["attach"] = {"ok": True, **attach(drv, state, target, cfg=cfg, sleep=sleep)}
-
+    target = BASE_URL if new_thread else (thread.get("url") or BASE_URL)
+    attach_res = attach(drv, state, target, cfg=cfg, sleep=sleep)
     pre = _info(drv)
     if new_thread and HREF_MATCH_SLACK in (pre.get("url") or ""):
         # A new task must start from home, not inside another thread.
@@ -821,9 +906,23 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         pre = _info(drv)
         if HREF_MATCH_SLACK in (pre.get("url") or ""):
             raise ConsoleError("attach", "still inside a thread after new-thread navigation",
-                               gates=gates, evidence=_evidence(drv))
+                               evidence=_evidence(drv), code="attach.still-thread")
+    return {"attach": {"ok": True, **attach_res}, "pre": pre, "target": target}
 
+
+def _stage_fill(drv: Any, state: dict, cfg: Config, query: str, *,
+                task: str, new_thread: bool, files: Optional[list],
+                sleep: Callable[[float], None]) -> dict:
+    """Stage a turn: ensure context, attach files, fill+verify, record pending.
+
+    Shared by ``console_ask``/``console_send``/``console_fill`` — one
+    implementation, three surfaces.
+    """
+    ctx = _ensure_task_context(drv, state, task=task, new_thread=new_thread,
+                               cfg=cfg, sleep=sleep)
+    gates: dict = {"attach": ctx["attach"]}
     file_names = [Path(f).expanduser().name for f in (files or [])]
+    file_paths = [str(Path(f).expanduser()) for f in (files or [])]
     if files:
         gates["files"] = _gate_files(drv, files, sleep=sleep)
 
@@ -836,7 +935,7 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         # empty) is reset by one page reload; the gate is then retried once.
         logger.warning("fill gate failed (%s); reloading page once and retrying",
                        fill_exc.message)
-        reload_url = _info(drv).get("url") or target
+        reload_url = _info(drv).get("url") or ctx["target"]
         drv.navigate(reload_url, new_tab=False)
         sleep(max(cfg.page_load_wait, 4.0))
         try:
@@ -850,12 +949,50 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
             }
             raise
 
-    base_bubbles = int(pre.get("bubbles") or 0)
-    base_studied = int(pre.get("studied") or 0)
-    base_prose_count = int(pre.get("proseCount") or 0)
+    pre = ctx["pre"]
+    pending = {
+        "task": task,
+        "query": query,
+        "new_thread": bool(new_thread),
+        "files": file_names,
+        "file_paths": file_paths,
+        "url": _info(drv).get("url") or "",
+        "base_bubbles": int(pre.get("bubbles") or 0),
+        "base_studied": int(pre.get("studied") or 0),
+        "base_prose_count": int(pre.get("proseCount") or 0),
+        "filled_at": _now_iso(),
+        "status": "filled",
+    }
+    state["pending"] = pending
+    state["active_task"] = task
+    save_state(state)
+    return {"ok": True, "gates": gates, "pending": pending}
+
+
+def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, *,
+                          files: Optional[list],
+                          submit_timeout: float, submit_recheck_timeout: float,
+                          poll_interval: float,
+                          sleep: Callable[[float], None],
+                          context_gates: Optional[dict] = None,
+                          gates_out: Optional[dict] = None,
+                          expect_url: Optional[str] = None) -> dict:
+    """Submit gate with bounded recovery (delayed ownership → reload+retry).
+
+    The recovery is duplicate-safe: it only re-submits after a delayed
+    ownership recheck proves the turn was NOT actually sent.
+    """
+    if expect_url:
+        current = _info(drv).get("url") or ""
+        if not _url_matches(current, expect_url):
+            raise ConsoleError(
+                "pending",
+                f"page moved: staged on {expect_url!r}, currently at {current!r}; "
+                "run `console fill` again",
+                code="pending.page-moved")
     try:
-        gates["submit"] = _gate_submit(drv, query, base_bubbles,
-                                       timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+        return _gate_submit(drv, query, base_bubbles,
+                            timeout=submit_timeout, poll=poll_interval, sleep=sleep)
     except ConsoleError as submit_exc:
         if submit_exc.gate != "submit":
             raise
@@ -863,32 +1000,47 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         # late-but-correct turn never gets sent twice.
         if _wait_ownership(drv, query, base_bubbles, timeout=submit_recheck_timeout,
                            poll=poll_interval, sleep=sleep):
-            gates["submit"] = {"ok": True, "mechanism": "delayed-ownership",
-                               "actions": [{"action": "late-ownership", "result": "ok"}]}
-        else:
-            # Bounded recovery: a mis-sent state (e.g. file-only submission /
-            # stale editor state) is cleared by one page reload; re-inject
-            # files and retry the submit gate exactly once.
-            logger.warning("submit gate failed (%s); reloading and retrying once",
-                           submit_exc.message)
-            reload_url = _info(drv).get("url") or target
-            drv.navigate(reload_url, new_tab=False)
-            sleep(max(cfg.page_load_wait, 4.0))
-            if files:
-                gates["files_retry"] = _gate_files(drv, files, sleep=sleep)
-            try:
-                gates["submit"] = _gate_submit(drv, query, base_bubbles,
-                                               timeout=submit_timeout, poll=poll_interval,
-                                               sleep=sleep)
-                gates["submit"]["recovered"] = "reload"
-            except ConsoleError as exc2:
-                exc2.gates = {"submit_first_error": {"message": submit_exc.message,
-                                                     "evidence": submit_exc.evidence},
-                              **gates}
-                raise
-    gates["complete"] = _gate_complete(drv, base_studied,
-                                       base_prose_count=base_prose_count,
-                                       wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
+            return {"ok": True, "mechanism": "delayed-ownership",
+                    "actions": [{"action": "late-ownership", "result": "ok"}]}
+        # Bounded recovery: a mis-sent state (e.g. file-only submission /
+        # stale editor state) is cleared by one page reload; re-inject
+        # files and retry the submit gate exactly once.
+        logger.warning("submit gate failed (%s); reloading and retrying once",
+                       submit_exc.message)
+        reload_url = _info(drv).get("url") or BASE_URL
+        drv.navigate(reload_url, new_tab=False)
+        sleep(max(cfg.page_load_wait, 4.0))
+        files_retry = None
+        if files:
+            files_retry = _gate_files(drv, files, sleep=sleep)
+            if gates_out is not None:
+                gates_out["files_retry"] = files_retry
+        try:
+            result = _gate_submit(drv, query, base_bubbles,
+                                  timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+            result["recovered"] = "reload"
+            return result
+        except ConsoleError as exc2:
+            merge = {"submit_first_error": {"message": submit_exc.message,
+                                            "evidence": submit_exc.evidence}}
+            if files_retry is not None:
+                merge["files_retry"] = files_retry
+            if context_gates:
+                merge.update(context_gates)
+            exc2.gates = merge
+            raise
+
+
+def _extract_step(drv: Any, state: dict, cfg: Config, *,
+                  sleep: Callable[[float], None],
+                  pending: Optional[dict] = None,
+                  gates_out: Optional[dict] = None) -> dict:
+    """Expand, extract the turn-scoped answer + sources, update bookkeeping.
+
+    With ``pending`` the thread record is updated and the staged turn is
+    cleared (exactly once); without it this is a read-only ad-hoc extract.
+    """
+    gates = gates_out if gates_out is not None else {}
 
     expand = _js(drv, _JS_EXPAND, "none")
     if expand == "clicked":
@@ -898,13 +1050,13 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
     prose = _js(drv, _JS_PROSE, {})
     if (not isinstance(prose, dict) or not prose.get("found")
             or not _normalize(prose.get("text"))):
-        evidence = _evidence(drv)
         gates["extract"] = {"ok": False}
         raise ConsoleError("extract", "latest answer text is empty",
-                           gates=gates, evidence=evidence)
+                           gates=gates, evidence=_evidence(drv), code="extract.empty")
     gates["extract"] = {"ok": True, "chars": len(prose["text"])}
 
-    if files:
+    file_names = list((pending or {}).get("files") or [])
+    if file_names:
         payload = _js(drv, _JS_CHIPS, {})
         remaining = payload.get("attachments") if isinstance(payload, dict) else []
         gates["send"] = {"chips_cleared": not any(n in (remaining or []) for n in file_names)}
@@ -915,18 +1067,22 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
 
     post = _info(drv)
     url = post.get("url") or ""
-    now = _now_iso()
-    if HREF_MATCH_SLACK in url:
-        entry = dict(state["threads"].get(task) or {})
-        entry.update({"url": url, "last_used_at": now})
-        if new_thread or not entry.get("created_at") or "url" not in entry:
-            entry["created_at"] = now
-            entry["label"] = _normalize(query)[:80]
-            entry["turns"] = 1
-        else:
-            entry["turns"] = int(entry.get("turns") or 0) + 1
-        state["threads"][task] = entry
-    state["active_task"] = task
+    if pending:
+        task_name = pending.get("task") or "default"
+        q = pending.get("query") or ""
+        now = _now_iso()
+        if HREF_MATCH_SLACK in url:
+            entry = dict(state["threads"].get(task_name) or {})
+            entry.update({"url": url, "last_used_at": now})
+            if pending.get("new_thread") or not entry.get("created_at") or "url" not in entry:
+                entry["created_at"] = now
+                entry["label"] = _normalize(q)[:80]
+                entry["turns"] = 1
+            else:
+                entry["turns"] = int(entry.get("turns") or 0) + 1
+            state["threads"][task_name] = entry
+        state["active_task"] = task_name
+        state["pending"] = None  # the staged turn is consumed
     save_state(state)
 
     return {
@@ -937,13 +1093,268 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         "url": url,
         "title": post.get("title") or "",
         "model": post.get("model") or "",
-        "attachments": file_names,
+    }
+
+
+def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
+                files: Optional[list] = None,
+                wait_budget: float = DEFAULT_WAIT, poll_interval: float = POLL_INTERVAL,
+                submit_timeout: float = SUBMIT_TIMEOUT,
+                submit_recheck_timeout: float = 6.0,
+                config: Optional[Config] = None, driver: Any = None,
+                sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Ask the resident console one question, with every step verified.
+
+    Composite of the granular steps (fill → submit → wait → extract), each
+    backed by the same gate implementation the step commands use. One task =
+    one Perplexity thread; without ``new_thread`` the task's thread is
+    continued as a follow-up.
+    """
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    started = time.monotonic()
+
+    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
+                         files=files, sleep=sleep)
+    gates = dict(staged["gates"])
+    pending = staged["pending"]
+
+    gates["submit"] = _submit_with_recovery(
+        drv, cfg, query, pending["base_bubbles"], files=files,
+        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
+        poll_interval=poll_interval, sleep=sleep, context_gates=gates, gates_out=gates)
+
+    gates["complete"] = _gate_complete(drv, pending["base_studied"],
+                                       base_prose_count=pending["base_prose_count"],
+                                       wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
+
+    out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
+    _log_run("ask", ok=True, url=out["url"],
+             elapsed=time.monotonic() - started)
+
+    return {
+        "ok": True,
+        "answer": out["answer"],
+        "raw_answer": out["raw_answer"],
+        "sources": out["sources"],
+        "url": out["url"],
+        "title": out["title"],
+        "model": out["model"],
+        "attachments": pending["files"],
         "task": task,
         "session": state["session"],
         "new_thread": new_thread,
         "gates": gates,
         "elapsed_s": round(time.monotonic() - started, 1),
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# Granular steps (intent composition surface)
+# ──────────────────────────────────────────────────────────────
+
+def console_open(target: str, *, new_thread: bool = False,
+                 config: Optional[Config] = None, driver: Any = None,
+                 sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Attach the console tab to a task thread (by name) or a direct URL."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    if target.startswith("http"):
+        tabs = _tabs(drv)
+        if tabs:
+            drv.navigate(target, new_tab=False)
+        else:
+            drv.navigate(target, new_tab=True, group_title=state["group_title"])
+        sleep(cfg.page_load_wait)
+        info = _info(drv)
+        if not _url_matches(info.get("url") or "", target):
+            raise ConsoleError("attach", f"tab did not reach {target!r}",
+                               evidence=_evidence(drv), code="attach.navigate")
+        _log_run("open", ok=True, url=info.get("url"))
+        return {"ok": True, "url": info.get("url") or "", "target": target,
+                "new_thread": False}
+    ctx = _ensure_task_context(drv, state, task=target, new_thread=new_thread,
+                               cfg=cfg, sleep=sleep)
+    state["active_task"] = target
+    save_state(state)
+    _log_run("open", ok=True, url=ctx["pre"].get("url"))
+    return {"ok": True, "url": ctx["pre"].get("url") or "", "target": target,
+            "new_thread": new_thread, "attach": ctx["attach"]}
+
+
+def console_fill(query: str, *, task: str = "default", new_thread: bool = False,
+                 files: Optional[list] = None,
+                 config: Optional[Config] = None, driver: Any = None,
+                 sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Stage a turn: attach files, fill the composer, verify — no send."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
+                         files=files, sleep=sleep)
+    _log_run("fill", ok=True, url=staged["pending"].get("url"))
+    return {"ok": True, "gates": staged["gates"], "pending": staged["pending"]}
+
+
+def console_submit(*, config: Optional[Config] = None, driver: Any = None,
+                   sleep: Callable[[float], None] = time.sleep,
+                   submit_timeout: float = SUBMIT_TIMEOUT,
+                   submit_recheck_timeout: float = 6.0,
+                   poll_interval: float = POLL_INTERVAL) -> dict:
+    """Submit the staged turn (composer re-verified; bounded recovery)."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    pending = _pending_require(state, stage="submit")
+    gates: dict = {}
+    gates["submit"] = _submit_with_recovery(
+        drv, cfg, pending["query"], int(pending.get("base_bubbles") or 0),
+        files=list(pending.get("file_paths") or []),
+        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
+        poll_interval=poll_interval, sleep=sleep, context_gates={},
+        gates_out=gates, expect_url=pending.get("url"))
+    pending["submitted_at"] = _now_iso()
+    pending["status"] = "submitted"
+    state["pending"] = pending
+    save_state(state)
+    _log_run("submit", ok=True, url=pending.get("url"))
+    return {"ok": True, "gates": gates, "pending_status": "submitted"}
+
+
+def console_wait(*, config: Optional[Config] = None, driver: Any = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 wait_budget: float = DEFAULT_WAIT,
+                 poll_interval: float = POLL_INTERVAL) -> dict:
+    """Wait for the staged turn's answer to settle (turn-scoped completion)."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    pending = _pending_require(state, stage="wait")
+    gate = _gate_complete(drv, int(pending.get("base_studied") or 0),
+                          base_prose_count=int(pending.get("base_prose_count") or 0),
+                          wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
+    pending["completed_at"] = _now_iso()
+    pending["status"] = "completed"
+    state["pending"] = pending
+    save_state(state)
+    _log_run("wait", ok=True, url=pending.get("url"))
+    return {"ok": True, "gates": {"complete": gate}}
+
+
+def console_extract(*, config: Optional[Config] = None, driver: Any = None,
+                    sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Extract the newest answer (+sources); consumes the staged turn."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    pending = _pending(state) or None
+    gates: dict = {}
+    out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
+    out["gates"] = gates
+    out["task"] = (pending or {}).get("task") or state.get("active_task")
+    _log_run("extract", ok=True, url=out.get("url"))
+    return out
+
+
+def console_send(query: str, *, task: str = "default", new_thread: bool = False,
+                 files: Optional[list] = None,
+                 config: Optional[Config] = None, driver: Any = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 submit_timeout: float = SUBMIT_TIMEOUT,
+                 submit_recheck_timeout: float = 6.0,
+                 poll_interval: float = POLL_INTERVAL) -> dict:
+    """Stage and submit in one call (fill + submit); no wait/extract."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
+                         files=files, sleep=sleep)
+    gates = dict(staged["gates"])
+    pending = staged["pending"]
+    gates["submit"] = _submit_with_recovery(
+        drv, cfg, query, pending["base_bubbles"], files=files,
+        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
+        poll_interval=poll_interval, sleep=sleep, context_gates=gates, gates_out=gates)
+    pending["submitted_at"] = _now_iso()
+    pending["status"] = "submitted"
+    state["pending"] = pending
+    save_state(state)
+    _log_run("send", ok=True, url=pending.get("url"))
+    return {"ok": True, "gates": gates, "pending": pending, "task": task}
+
+
+def console_attach(files: list, *, config: Optional[Config] = None, driver: Any = None,
+                   sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Attach local files to the composer (idempotent, chips verified)."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    if not files:
+        raise ConsoleError("file", "no files given", code="file.not-found")
+    _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
+    gate = _gate_files(drv, files, sleep=sleep)
+    pending = _pending(state)
+    if not pending:
+        pending = {"task": state.get("active_task") or "default", "query": None,
+                   "new_thread": False, "files": [], "file_paths": [],
+                   "url": _info(drv).get("url") or "", "filled_at": _now_iso(),
+                   "status": "attached"}
+    names = [i["name"] for i in gate["injected"]]
+    pending["files"] = sorted(set(list(pending.get("files") or []) + names))
+    pending["file_paths"] = sorted(set(list(pending.get("file_paths") or []) +
+                                       [str(Path(f).expanduser()) for f in files]))
+    state["pending"] = pending
+    save_state(state)
+    _log_run("attach", ok=True)
+    return {"ok": True, "gates": {"files": gate}, "pending_files": pending["files"]}
+
+
+def console_detach(name: str, *, config: Optional[Config] = None, driver: Any = None,
+                   sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Remove one composer attachment by name (verified)."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    code = ("""(() => { const removeBtn = Array.from(document.querySelectorAll('button'))"""
+            """.find(b => (b.getAttribute('aria-label') || '') === __LABEL__); """
+            """if (!removeBtn) return 'not-found'; removeBtn.click(); return 'clicked'; })()"""
+            ).replace("__LABEL__", json.dumps(f"移除 {name}"))
+    result = _js(drv, code, "not-found")
+    if result != "clicked":
+        raise ConsoleError("file", f"attachment {name!r} not found as a chip",
+                           code="file.chip-missing")
+    sleep(1.0)
+    chips = _js(drv, _JS_CHIPS, {})
+    remaining = chips.get("attachments") if isinstance(chips, dict) else []
+    if name in (remaining or []):
+        raise ConsoleError("file", f"attachment {name!r} still present after remove",
+                           code="file.chip-missing")
+    pending = _pending(state)
+    if pending:
+        pending["files"] = [n for n in (pending.get("files") or []) if n != name]
+        pending["file_paths"] = [p for p in (pending.get("file_paths") or [])
+                                 if Path(p).name != name]
+        state["pending"] = pending
+        save_state(state)
+    _log_run("detach", ok=True)
+    return {"ok": True, "detached": name, "chips": remaining or []}
+
+
+def console_files(*, config: Optional[Config] = None, driver: Any = None,
+                  sleep: Callable[[float], None] = time.sleep) -> dict:
+    """List current composer attachments and the staged file set."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
+    chips = _js(drv, _JS_CHIPS, {})
+    attachments = chips.get("attachments") if isinstance(chips, dict) else []
+    pending = _pending(state)
+    return {"ok": True, "chips": attachments,
+            "pending_files": pending.get("files") or [],
+            "pending_status": pending.get("status")}
 
 
 def console_status(*, config: Optional[Config] = None, driver: Any = None) -> dict:
@@ -954,6 +1365,7 @@ def console_status(*, config: Optional[Config] = None, driver: Any = None) -> di
         "group_title": state["group_title"],
         "active_task": state.get("active_task"),
         "threads": state.get("threads") or {},
+        "pending": state.get("pending"),
         "live": None,
     }
     drv = driver or _make_driver(config or get_config(), state)
@@ -1011,6 +1423,7 @@ def console_selfcheck(*, wait_budget: float = DEFAULT_WAIT,
                              config=config, driver=driver, sleep=sleep)
     except ConsoleError as exc:
         return {"ok": False, "gate": exc.gate, "error": exc.message,
+                "error_code": exc.code,
                 "evidence": exc.evidence, "gates": exc.gates,
                 "elapsed_s": round(time.monotonic() - started, 1)}
     return result

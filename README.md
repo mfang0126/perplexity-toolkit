@@ -68,7 +68,20 @@ perplexity console threads     # recorded task threads
 perplexity console selfcheck   # run the full gate pipeline on a canned query
 ```
 
-- **Gates, not best effort**: every step is verified (composer equality incl. editor state, user-turn ownership, completion signals, turn-scoped answer extraction). Failures raise with a screenshot under `~/.perplexity-console/evidence/` — silent wrong answers are the one outcome the console never reports as success.
+Granular steps for intent-driven composition (share one implementation with `ask`, joined by a staged-turn ledger):
+
+```bash
+perplexity console fill "q" [--task T] [--file F]   # stage: attach + fill + verify (no send)
+perplexity console submit                            # submit the staged turn (verified, self-healing)
+perplexity console wait [--wait N]                   # wait for the staged answer to settle
+perplexity console extract                           # turn-scoped answer; consumes the staged turn
+perplexity console send "q"                          # fill + submit only
+perplexity console attach --file F | files | detach NAME
+perplexity console open <task|url> [--new-thread]
+```
+
+- **Gates, not best effort**: every step is verified (composer equality incl. editor state, user-turn ownership, completion signals, turn-scoped answer extraction). Failures raise with a screenshot under `~/.perplexity-console/evidence/` and a machine-readable `error_code` — silent wrong answers are the one outcome the console never reports as success.
+- **Stepwise, not one-shot**: `ask` is a composite of granular steps (`fill → submit → wait → extract`) that share one implementation each; the steps are also callable alone and compose through a staged-turn ledger (`state.json → pending`), so retries and unusual flows are per-step instead of all-or-nothing. Every run appends one line to `~/.perplexity-console/runs.jsonl`.
 - **Model & files**: `perplexity console models` / `model "<name>"` switch the Perplexity model with a verified readback; `ask --file` attaches local files (in-page injection, ≤8MB) and verifies every attachment chip before sending.
 - **Durable state**: `~/.perplexity-console/state.json` (session, group, per-task thread URLs). WebBridge session→tab mappings are daemon-memory only; the console attach-or-recreates the tab from the saved thread URL after daemon/browser restarts.
 - **Self-heal**: a desynced editor (DOM text vs internal state) is repaired by one bounded page reload before failing loudly; mis-sent turns (e.g. file-only) recover via reload + re-inject + a bounded, duplicate-safe retry.
