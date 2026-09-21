@@ -144,6 +144,10 @@ def test_route_gate_only_matches_explicit_browser_wording():
     assert select_route("Perplexity search the best web frameworks")['route'] == "cli"
     assert select_route("请用网页方式搜索 Perplexity")['route'] == "browser"
     assert select_route("Open Perplexity in Chrome")['route'] == "browser"
+    # One-sentence browser requests (verified 2026-09-21)
+    assert select_route("用网页搜 Perplexity")['route'] == "browser"
+    assert select_route("帮我拿网页版的 Perplexity 搜东西")['route'] == "browser"
+    assert select_route("拿网页版 Perplexity 问一下这个问题")['route'] == "browser"
 
 
 def test_route_cli_command_is_local_and_machine_readable(capsys):

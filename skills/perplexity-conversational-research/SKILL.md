@@ -150,6 +150,8 @@ perplexity console ask "query" --task <task> [--new-thread] [-f json]
 perplexity console status | threads | selfcheck
 ```
 
+**Trigger phrases → console**: when the user says 「用网页(版)的 Perplexity 搜/问…」「拿浏览器里的 Perplexity 搜…」「用（perplexity）控制台问…」, run `perplexity console ask` directly — pick one stable `--task` name from the topic (reuse the existing task name to continue an earlier thread). Do not hand-drive the raw browser steps and do not route these through `perplexity search`; the console is the executor for this route.
+
 Continuation semantics: same task → follow-up in the same thread; a new task or `--new-thread` → a fresh thread in the same tab (home → submit). State (per-task thread URLs) persists in `~/.perplexity-console/state.json`, so daemon/browser restarts do not break continuity. Every step is gated (fill equality → user-turn ownership → completion signals → turn-scoped extraction) with loud, evidence-bearing failures. When the console is unavailable, fall back to the manual recipe below.
 
 ### Fixed group + one-tab variant

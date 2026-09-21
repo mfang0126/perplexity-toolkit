@@ -15,6 +15,8 @@ class RouteDecision(TypedDict):
 # should select direct WebBridge execution.
 _DIRECT_BROWSER_MARKERS = (
     ("网页方式", re.compile(r"网页方式")),
+    ("网页版", re.compile(r"网页版")),
+    ("用网页", re.compile(r"(?:用|拿|走|通过)\s*网页")),
     ("web page", re.compile(r"\bweb\s+page\b", re.IGNORECASE)),
     ("browser", re.compile(r"\bbrowser\b|浏览器")),
     ("Chrome", re.compile(r"\bchrome\b", re.IGNORECASE)),
