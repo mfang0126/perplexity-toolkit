@@ -3,7 +3,7 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.3.0"
+  version: "0.3.1"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 
@@ -59,6 +59,12 @@ Interpret the result before changing anything:
 - An extension message such as “already linked” is not a Perplexity thread limit. It usually means an existing daemon/session owns the browser connection or a stale pairing is being reported. Reuse the current task session; never stop/restart/close the user's connection automatically.
 
 A successful `navigate` returning a `tabId`, followed by `list_tabs` showing one active Perplexity tab, is the authoritative connection readback.
+
+### 0a. Observed transients & fixes (from a live run, 2026-09-21)
+
+- **First evaluate after idle can 502**: right after an idle period, the first `evaluate` (including the live readback inside `console status`) may return `WebBridge HTTP 502 Bad Gateway` while the `live` fields show null. A single retry of the same command recovers — do NOT restart the daemon and do NOT close tabs. If it fails twice in a row, use the recovery cookbook: `console open <task>` to re-attach, then continue.
+- **Duplicate tabs in the resident group**: the `perplexity-console` group can show two tabs for the same thread URL (the ledger tracks only 1; the `attach` gate reporting `tab_count: 2` is tolerated and fill/submit/extract still work). Dedupe convention: **after the task completes** (never close a tab that is mid-use), prefer `find_tab <old-thread-url>` + `close_tab` to drop the stale tab; otherwise close one duplicate of the current thread. Then `list_tabs` to confirm exactly 1 tab remains, and record the collision + resolution in the closeout report.
+- **Optional hardening (not yet implemented)**: auto-retry one 502 at the evaluate layer; auto-dedupe tabs at attach; flag ledger(1) vs live(2+) tab-count drift as a duplicate collision.
 
 ### 1. Search (Proven 2026-08-29; connection smoke-tested 2026-09-05)
 
