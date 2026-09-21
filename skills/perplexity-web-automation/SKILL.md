@@ -3,7 +3,7 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.1.3"
+  version: "0.2.0"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 

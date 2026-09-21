@@ -125,7 +125,7 @@ Properties:
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - Google Chrome with the Kimi WebBridge extension, and the WebBridge daemon
   reachable at `http://127.0.0.1:10086/command`
   (override with `PERPLEXITY_WEBBRIDGE_URL`)

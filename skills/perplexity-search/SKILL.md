@@ -13,7 +13,7 @@ browser wording, the execution route is the `perplexity` CLI.
 
 ## WebBridge boundary
 
-Any Perplexity action through the user's logged-in Chrome is executed by `perplexity-web-automation` (via `kimi-webbridge`); this skill does not maintain browser operation flows.
+Any Perplexity action through the user's logged-in Chrome is executed by `perplexity-web-automation` (via `kimi-webbridge`); this skill does not maintain browser operation flows. For repeat browser use in one fixed tab/group, the executor is the resident console (`perplexity console ...`, documented in `perplexity-web-automation`) — trigger it for 「用网页(版)的 Perplexity 搜/问」-style requests as described there.
 
 Keep these concepts separate:
 

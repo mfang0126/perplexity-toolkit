@@ -2,7 +2,7 @@
 name: perplexity-conversational-research
 description: "Use when the user wants deep or multi-turn Perplexity research, follow-up questions on the same thread, or several model perspectives on one topic (say \"用 perplexity 研究\" / \"perplexity 搜一下\"). The single research-policy entry point: picks between the perplexity CLI and the browser route, keeps one session and conversation URL across turns. Quick one-shot lookups go to perplexity-search; raw browser actions go to perplexity-web-automation."
 metadata:
-  version: "1.0.2"
+  version: "1.1.0"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
   optional: ["perplexity-toolkit"]
 ---

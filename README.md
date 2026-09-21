@@ -127,11 +127,18 @@ perplexity_toolkit/
 ├── search.py            # Core search functions (4 modes)
 ├── batch.py             # Batch pipeline with resume
 ├── aggregator.py        # Result aggregation + reports
+├── history.py           # Conversation history management
+├── verify.py            # Source/answer quality verification
+├── routing.py           # User-intent route gate (CLI vs direct browser)
+├── console.py           # Resident console (fixed tab/group, verified step gates)
+├── console_judge.py     # Optional Jev judge layer (advisory, fail-open)
 ├── drivers/             # Browser driver abstraction
 │   ├── base.py          # Abstract BrowserDriver interface
 │   └── webbridge.py     # Kimi WebBridge implementation
-├── utils/               # DOM parsing + event helpers
-│   └── __init__.py
+├── utils/               # DOM parsing + event/timing helpers
+│   ├── __init__.py
+│   ├── antidetect.py    # Human-like timing / anti-detection
+│   └── i18n.py          # UI-string locale tables
 └── commands/            # CLI
     └── cli.py
 ```
@@ -206,8 +213,8 @@ and report "not resolved in this environment" rather than "not installed".
 ## Known Limitations
 
 - Deep Research mode leaks a "/" prefix in the query (Perplexity handles it gracefully)
-- Model selector dropdown requires CDP-level clicks (not yet automated)
-- File upload flow not yet mapped
+- Jev submenu model entries (e.g. "GPT-5.6 Sol | Max") are listed by `console models` but not programmatically selectable yet
+- Console attachments are capped at 8 MB via in-page injection; larger files need Chrome's per-extension "Allow access to file URLs" for the official WebBridge upload path
 
 ## Research
 
@@ -232,6 +239,7 @@ Perplexity Toolkit 通过浏览器控制自动化 Perplexity AI 搜索 — 支�
 - **结果聚合**：去重来源、按频次排序、自动生成报告
 - **来源提取**：获取所有引用链接，含标题与摘要
 - **追问捕获**：提取 Perplexity 推荐的后续追问问题
+- **常驻控制台**：固定 tab/group 工作台——任务线程、分步命令、模型切换、附件、可选 Jev 判真
 - **历史管理**：查看与管理搜索历史
 - **Agent Skills**：[`skills/`](skills/) 下三份可直接加载的 `SKILL.md`——路由策略、会话纪律、验证规则——供驱动本工具包的 agent 使用
 
@@ -297,6 +305,9 @@ perplexity console status | threads | selfcheck
 - 每步都有读回闸门（输入框等值+编辑器状态、提问轮次归属、完成信号、轮次作用域提取）；失败必带截图证据（`~/.perplexity-console/evidence/`），不会把未验证结果当作成功。
 - 状态落盘 `~/.perplexity-console/state.json`；daemon 重启后自动重建 tab 并回到保存的线程 URL（session→tab 映射仅存于 daemon 内存）。
 - 编辑器与内部状态脱钩时先做一次有界重载自愈，仍失败则大声报错。
+- 分步命令 `fill / submit / wait / extract / send / attach / files / detach / open` 由 staged-turn 账本衔接——可单独重试、可自由组合（意图驱动）。
+- `perplexity console models` / `model "<名称>"` 切换模型（回读验证）；`ask --file` 附加文件（≤8MB，chip 验证）。
+- 可选 Jev 判真（`--judge` 或 `PERPLEXITY_CONSOLE_JUDGE=1`）：提取判真 + 失败路由建议；fail-open，管道永不依赖它。
 
 ## Python API
 
@@ -337,11 +348,18 @@ perplexity_toolkit/
 ├── search.py            # 核心搜索函数（4 种模式）
 ├── batch.py             # 批量流水线（支持恢复）
 ├── aggregator.py        # 结果聚合与报告
+├── history.py           # 会话历史管理
+├── verify.py            # 来源/答案质量校验
+├── routing.py           # 用户意图路由门（CLI vs 直连浏览器）
+├── console.py           # 常驻控制台（固定 tab/group，逐步闸门）
+├── console_judge.py     # 可选 Jev 判真层（advisory，fail-open）
 ├── drivers/             # 浏览器驱动抽象层
 │   ├── base.py          # 抽象 BrowserDriver 接口
 │   └── webbridge.py     # Kimi WebBridge 实现
-├── utils/               # DOM 解析与事件辅助
-│   └── __init__.py
+├── utils/               # DOM 解析与事件/时序辅助
+│   ├── __init__.py
+│   ├── antidetect.py    # 拟人节奏 / 反检测
+│   └── i18n.py          # 界面文案多语言表
 └── commands/            # CLI
     └── cli.py
 ```
@@ -414,8 +432,8 @@ curl -s -X POST http://127.0.0.1:10086/command \
 ## 已知限制
 
 - 深度研究模式会在查询中多出一个 "/" 前缀（Perplexity 可正常处理）
-- 模型选择下拉框需要 CDP 级点击（尚未自动化）
-- 文件上传流程尚未映射
+- Jev 子菜单模型项（如 "GPT-5.6 Sol | Max"）会出现在 `console models` 列表中，但暂不支持程序化选择
+- 控制台附件通过页内注入上传，上限 8MB；更大文件需为 Kimi 扩展开启 Chrome 的「允许访问文件网址」，走官方 WebBridge 上传通道
 
 ## 许可
 
