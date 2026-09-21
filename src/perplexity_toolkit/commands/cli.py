@@ -24,6 +24,90 @@ def cmd_route(args) -> int:
     return 0
 
 
+def cmd_console(args) -> int:
+    """Resident Perplexity console actions."""
+    from ..console import (ConsoleError, console_ask, console_selfcheck,
+                           console_status, console_threads)
+    action = getattr(args, "console_action", None)
+    fmt = getattr(args, "format", "text")
+
+    if action == "ask":
+        try:
+            result = console_ask(args.query, task=args.task,
+                                 new_thread=args.new_thread,
+                                 wait_budget=args.wait_budget)
+        except ConsoleError as exc:
+            payload = {"ok": False, "gate": exc.gate, "error": exc.message,
+                       "evidence": exc.evidence, "gates": exc.gates}
+            if fmt == "json":
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"FAILED at gate: {exc.gate}")
+                print(f"  {exc.message}")
+                if exc.evidence:
+                    print(f"  evidence: {exc.evidence}")
+            return 1
+        if fmt == "json":
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(result["answer"])
+            print("\n--- console ---")
+            print(f"task: {result['task']}  session: {result['session']}"
+                  f"  new_thread: {result['new_thread']}  elapsed: {result['elapsed_s']}s")
+            print(f"url: {result['url']}")
+            print(f"sources: {len(result['sources'])}")
+            gate_bits = []
+            for name, value in result["gates"].items():
+                gate_bits.append(f"{name}={'ok' if isinstance(value, dict) else value}")
+            print("gates: " + ", ".join(gate_bits))
+        return 0
+
+    if action == "status":
+        payload = console_status()
+        if fmt == "json":
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"session: {payload['session']}  group: {payload['group_title']}")
+            print(f"active_task: {payload['active_task']}")
+            for name, entry in payload["threads"].items():
+                print(f"  - {name}: {entry.get('url', '')}  (turns={entry.get('turns', '?')})")
+            print(f"live: {json.dumps(payload.get('live'), ensure_ascii=False)}")
+        return 0
+
+    if action == "threads":
+        payload = console_threads()
+        if fmt == "json":
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for name, entry in payload["threads"].items():
+                marker = "*" if name == payload.get("active_task") else " "
+                print(f"{marker} {name}: {entry.get('label', '')} "
+                      f"[turns={entry.get('turns', '?')}] {entry.get('url', '')}")
+        return 0
+
+    if action == "selfcheck":
+        result = console_selfcheck(wait_budget=args.wait_budget)
+        if fmt == "json":
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            if result.get("ok"):
+                print("SELFCHECK PASSED")
+                print(f"answer: {result['answer'][:200]}")
+                for name, value in result["gates"].items():
+                    print(f"  gate {name}: {json.dumps(value, ensure_ascii=False)}")
+                print(f"elapsed: {result['elapsed_s']}s")
+            else:
+                print("SELFCHECK FAILED")
+                print(f"  gate: {result.get('gate')}")
+                print(f"  error: {result.get('error')}")
+                if result.get("evidence"):
+                    print(f"  evidence: {result['evidence']}")
+        return 0 if result.get("ok") else 1
+
+    print("usage: perplexity console {ask,status,threads,selfcheck} ...")
+    return 2
+
+
 def cmd_search(args):
     """Single search."""
     from ..search import search, deep_research, model_council, step_by_step
@@ -204,6 +288,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("request", help="Original user wording, not a search query")
     p.add_argument("-f", "--format", default="json", choices=["json", "text"])
 
+    # console
+    p = sub.add_parser("console", help="Resident Perplexity console (fixed tab/group)")
+    csub = p.add_subparsers(dest="console_action")
+    pc = csub.add_parser("ask", help="Ask the console; creates or continues a task thread")
+    pc.add_argument("query")
+    pc.add_argument("--task", default="default", help="Task name; one task = one thread")
+    pc.add_argument("--new-thread", action="store_true",
+                    help="Start a new Perplexity thread in the same tab")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0,
+                    help="Completion budget in seconds")
+    pc = csub.add_parser("status", help="Show console state and live tab readback")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc = csub.add_parser("threads", help="List known task threads")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc = csub.add_parser("selfcheck", help="Run the full gate pipeline on a canned query")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0)
+
     return parser
 
 
@@ -229,6 +332,8 @@ def main():
 
     if args.command == "route":
         return cmd_route(args)
+    elif args.command == "console":
+        return cmd_console(args)
     elif args.command == "search":
         return cmd_search(args)
     elif args.command == "batch":

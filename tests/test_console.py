@@ -1,0 +1,408 @@
+"""Tests for the resident console: gates, attach, state, error paths.
+
+These tests drive the console against a deterministic in-memory driver that
+models the live-mapped perplexity.ai behavior:
+- user bubbles append on submit; the studied count and last-answer text
+  update when the answer lands;
+- ``fill`` is the editor's mutation path and replaces content; empty or
+  whitespace-only fill values are silent no-ops (observed live);
+- a late async draft-restore can merge extra text into the composer after a
+  successful fill (observed live: a merged draft+query produced a polluted
+  submission — the console must refill before submitting).
+"""
+import sys; sys.path.insert(0, "src")
+
+import pytest
+
+from perplexity_toolkit.config import Config
+from perplexity_toolkit.console import (
+    BASE_URL,
+    ConsoleError,
+    _bubble_owns,
+    _url_matches,
+    console_ask,
+    console_selfcheck,
+    console_status,
+    console_threads,
+    load_state,
+    save_state,
+)
+from perplexity_toolkit.drivers.base import BrowserDriver
+
+
+def make_config():
+    return Config(page_load_wait=0.0)
+
+
+def NOOP(_seconds):
+    return None
+
+
+class ConsoleFakeDriver(BrowserDriver):
+    """Deterministic in-memory driver for console tests."""
+
+    def __init__(self, *, share_tab=False, answer="答案 42。",
+                 url=BASE_URL, button_submit_works=True,
+                 composer_clears=False, studied_on_submit=True,
+                 submit_disabled=False, fill_noop_first=0,
+                 fill_appends=False, race_draft_after=None,
+                 race_draft_text="旧草稿", force_btn_disabled=False,
+                 btn_missing_first_click=0, desync_until_reload=False):
+        self.url = url
+        self.answer = answer
+        self.share_tab = share_tab
+        self.button_submit_works = button_submit_works
+        self.composer_clears = composer_clears
+        self.studied_on_submit = studied_on_submit
+        self.submit_disabled = submit_disabled
+        self.fill_noop_first = fill_noop_first
+        self.fill_appends = fill_appends
+        self.race_draft_after = race_draft_after
+        self.race_draft_text = race_draft_text
+        self.force_btn_disabled = force_btn_disabled
+        self.btn_missing_first_click = btn_missing_first_click
+        self.editor_desynced = desync_until_reload
+        self.composer = ""
+        self.bubbles = []
+        self.studied = 0
+        self.prose = []
+        self.generating = False
+        self.tab_url = url
+        self.calls = []
+        self.screenshots = []
+        self._fill_noops = 0
+        self._info_calls = 0
+        self._race_applied = False
+        self._submit_clicks = 0
+
+    def _btn_state(self):
+        """The submit button mirrors the editor's internal state."""
+        if self.force_btn_disabled:
+            return "disabled"
+        if self.editor_desynced:
+            return "disabled"
+        return "enabled" if self.composer.strip() else "disabled"
+
+    # -- BrowserDriver interface -------------------------------------------
+
+    def _tab(self):
+        return {"tabId": 1266525784, "url": self.tab_url, "title": "Perplexity",
+                "groupTitle": "Perplexity 控制台", "borrowed": False}
+
+    def list_tabs(self):
+        self.calls.append(("list_tabs",))
+        tabs = [self._tab()] if self.share_tab else []
+        return {"ok": True, "data": {"success": True, "tabs": tabs}}
+
+    def navigate(self, url, new_tab=True, group_title=""):
+        self.calls.append(("navigate", url, new_tab, group_title))
+        self.share_tab = True
+        self.url = url.rstrip("/") or BASE_URL
+        self.tab_url = self.url
+        self.editor_desynced = False  # a reload resets the editor
+        if url.rstrip("/") == BASE_URL.rstrip("/"):
+            self.bubbles = []
+            self.prose = []
+            self.studied = 0
+            self.composer = ""
+        return {"ok": True, "data": {"success": True, "url": url, "tabId": 1}}
+
+    def snapshot(self):
+        return {"data": {"tree": ""}}
+
+    def click(self, selector):
+        self.calls.append(("click", selector))
+        return {"ok": True}
+
+    def fill(self, selector, value):
+        self.calls.append(("fill", selector, value))
+        if not value.strip():
+            # empty/whitespace fills are silent no-ops in the real editor
+            return {"ok": True, "data": {"success": True, "mode": "contenteditable"}}
+        if self._fill_noops < self.fill_noop_first:
+            self._fill_noops += 1
+            return {"ok": True, "data": {"success": True, "mode": "contenteditable"}}
+        if self.fill_appends:
+            self.composer = self.composer + value
+        else:
+            self.composer = value
+        return {"ok": True, "data": {"success": True, "mode": "contenteditable"}}
+
+    def cdp(self, method, params=None):
+        self.calls.append(("cdp", method, params))
+        if method == "Input.insertText" and params:
+            self.composer = params.get("text", "")
+        return {"ok": True}
+
+    def evaluate(self, code):
+        self.calls.append(("evaluate", code[:60]))
+        if "cloneNode" in code:
+            text = self.prose[-1] if self.prose else ""
+            return {"found": bool(self.prose), "text": text, "raw": text}
+        if "user-bubble" in code:
+            self._info_calls += 1
+            if (self.race_draft_after is not None and not self._race_applied
+                    and self._info_calls >= self.race_draft_after):
+                # late async draft-restore merges extra text into the composer
+                self.composer = self.race_draft_text + "\n" + self.composer
+                self._race_applied = True
+            return {
+                "url": self.url,
+                "title": "Perplexity",
+                "composer": self.composer,
+                "submit_button": self._btn_state(),
+                "bubbles": len(self.bubbles),
+                "lastBubble": self.bubbles[-1] if self.bubbles else "",
+                "studied": self.studied,
+                "generating": self.generating,
+                "proseCount": len(self.prose),
+                "lastProseLen": len(self.prose[-1]) if self.prose else 0,
+            }
+        if "a[href]" in code:
+            return [{"text": "src", "href": "https://example.com/x"}]
+        if "提交" in code:
+            self._submit_clicks += 1
+            if self._submit_clicks <= self.btn_missing_first_click:
+                return "no-button"  # transient UI gap: button not found
+            if self.button_submit_works:
+                self._submit()
+            return "clicked:text"
+        if "dispatchEvent" in code:
+            self._submit()
+            return "enter dispatched"
+        if "=== '展开'" in code:
+            return "none"
+        return ""
+
+    def _submit(self):
+        if self.submit_disabled:
+            return
+        query = self.composer.strip()
+        if not query:
+            return
+        if self.bubbles and self.bubbles[-1].startswith(query):
+            return  # idempotent: this query is already the last turn
+        self.bubbles.append(query + "\n13:40")
+        if self.composer_clears:
+            self.composer = ""
+        if self.studied_on_submit:
+            self.studied += 1
+        self.prose.append(self.answer)
+        self.url = "https://www.perplexity.ai/search/fake-thread-1"
+        self.tab_url = self.url
+
+    def screenshot(self, path=None):
+        self.calls.append(("screenshot", path))
+        self.screenshots.append(path)
+        return {"ok": True, "data": {"path": path}}
+
+    def close(self):
+        return {"ok": True}
+
+
+@pytest.fixture(autouse=True)
+def tmp_console_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("PERPLEXITY_CONSOLE_HOME", str(tmp_path))
+    return tmp_path
+
+
+def _ask(drv, query, *, task="default", new_thread=False, wait_budget=1.0,
+         poll_interval=0.01, submit_timeout=0.4, sleep=NOOP):
+    return console_ask(query, task=task, new_thread=new_thread,
+                       wait_budget=wait_budget, poll_interval=poll_interval,
+                       submit_timeout=submit_timeout,
+                       config=make_config(), driver=drv, sleep=sleep)
+
+
+class TestConsoleAsk:
+    def test_fresh_session_creates_tab_and_passes_all_gates(self):
+        drv = ConsoleFakeDriver()
+        res = _ask(drv, "用一句话回答：1+1 等于几？")
+        assert res["ok"]
+        assert res["answer"] == "答案 42。"
+        assert res["gates"]["attach"]["created"] is True
+        assert res["gates"]["fill"]["ok"]
+        assert res["gates"]["fill"]["method"] == "fill"
+        assert res["gates"]["submit"]["ok"]
+        assert res["gates"]["submit"]["mechanism"] == "button"
+        assert res["gates"]["submit"]["actions"][0]["action"] == "composer-verified"
+        assert res["gates"]["complete"]["ok"]
+        assert res["gates"]["extract"]["ok"]
+        assert res["url"].startswith("https://www.perplexity.ai/search/")
+        state = load_state()
+        entry = state["threads"]["default"]
+        assert entry["url"].endswith("/search/fake-thread-1")
+        assert entry["turns"] == 1
+        assert state["active_task"] == "default"
+        creates = [c for c in drv.calls if c[0] == "navigate" and c[2] is True]
+        assert len(creates) == 1
+        assert creates[0][3] == "Perplexity 控制台"
+
+    def test_fill_gate_replaces_residual_content(self):
+        drv = ConsoleFakeDriver(share_tab=True, url=BASE_URL)
+        drv.composer = "残留草稿"
+        res = _ask(drv, "q-替换测试")
+        assert res["gates"]["fill"]["ok"]
+        assert res["gates"]["fill"]["method"] == "fill"
+        assert res["gates"]["fill"]["composer_before"] == "残留草稿"
+        assert drv.calls  # sanity
+
+    def test_fill_retries_silent_noop_with_inserttext(self):
+        drv = ConsoleFakeDriver(fill_noop_first=1)
+        res = _ask(drv, "q-静默失败重试")
+        assert res["gates"]["fill"]["ok"]
+        assert res["gates"]["fill"]["method"] == "cdp-insertText"
+        assert any(c[0] == "cdp" for c in drv.calls)
+
+    def test_late_draft_merge_is_refilled_before_submit(self):
+        drv = ConsoleFakeDriver(race_draft_after=4)
+        res = _ask(drv, "q-草稿竞态")
+        assert res["ok"]
+        actions = [a["action"] for a in res["gates"]["submit"]["actions"]]
+        assert actions[0] == "refill-before-submit"
+        # the submission carried ONLY the query, never the merged draft
+        assert drv.bubbles[0].split("\n")[0] == "q-草稿竞态"
+        assert not any("旧草稿" in b for b in drv.bubbles)
+
+    def test_fill_pollution_recovers_after_reload(self):
+        # A polluted composer (fill merging into leftovers) now self-heals:
+        # the bounded reload resets the editor and the retry produces a clean
+        # query — the submitted bubble must carry ONLY the query.
+        drv = ConsoleFakeDriver(share_tab=True, url=BASE_URL, fill_appends=True)
+        drv.composer = "残留"
+        res = _ask(drv, "q-污染")
+        assert res["ok"]
+        assert res["gates"]["fill"].get("recovered") == "reload"
+        assert drv.bubbles and drv.bubbles[0].startswith("q-污染")
+        assert not any("残留" in b for b in drv.bubbles)
+
+    def test_submit_falls_back_to_enter_combo(self):
+        drv = ConsoleFakeDriver(button_submit_works=False)
+        res = _ask(drv, "q-提交兜底")
+        actions = [a["action"] for a in res["gates"]["submit"]["actions"]]
+        assert actions == ["composer-verified", "click-submit-button", "enter-combo"]
+        assert res["gates"]["submit"]["mechanism"] == "combo"
+        assert res["gates"]["submit"]["ok"]
+
+    def test_submit_click_retry_after_transition_gap(self):
+        drv = ConsoleFakeDriver(btn_missing_first_click=1)
+        res = _ask(drv, "q-点击重试")
+        actions = [a["action"] for a in res["gates"]["submit"]["actions"]]
+        assert actions == ["composer-verified", "click-submit-button",
+                           "click-submit-button-retry"]
+        assert res["gates"]["submit"]["mechanism"] == "button"
+
+    def test_editor_state_desync_fails_loudly(self):
+        # DOM shows the query but the editor state never commits (submit
+        # button stays disabled even after a recovery reload): the fill gate
+        # must fail, not submit.
+        drv = ConsoleFakeDriver(force_btn_disabled=True)
+        with pytest.raises(ConsoleError) as excinfo:
+            _ask(drv, "q-状态脱钩")
+        assert excinfo.value.gate == "fill"
+        assert "btn='disabled'" in str(excinfo.value)
+        assert drv.screenshots
+        # the bounded recovery reload was attempted before giving up
+        navs = [c for c in drv.calls if c[0] == "navigate"]
+        assert any(c[2] is False for c in navs)
+
+    def test_fill_desync_recovers_after_reload(self):
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 1,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1",
+                                desync_until_reload=True)
+        res = _ask(drv, "q-重载恢复")
+        assert res["ok"]
+        assert res["gates"]["fill"].get("recovered") == "reload"
+        navs = [c for c in drv.calls if c[0] == "navigate"]
+        assert any(c[1].endswith("/search/fake-thread-1") and c[2] is False
+                   for c in navs)
+
+    def test_submit_gate_failure_raises_with_evidence(self):
+        drv = ConsoleFakeDriver(submit_disabled=True)
+        with pytest.raises(ConsoleError) as excinfo:
+            _ask(drv, "q-永不提交")
+        assert excinfo.value.gate == "submit"
+        assert excinfo.value.evidence
+        assert excinfo.value.evidence.endswith(".png")
+        assert drv.screenshots  # evidence screenshot was requested
+
+    def test_continuation_reuses_thread_and_counts_turns(self):
+        drv = ConsoleFakeDriver()
+        _ask(drv, "第一个问题")
+        creates_before = [c for c in drv.calls if c[0] == "navigate" and c[2] is True]
+        res2 = _ask(drv, "第二个问题")
+        assert res2["gates"]["attach"]["created"] is False
+        assert res2["new_thread"] is False
+        creates_after = [c for c in drv.calls if c[0] == "navigate" and c[2] is True]
+        assert len(creates_after) == len(creates_before)  # no new tab for continuation
+        state = load_state()
+        assert state["threads"]["default"]["turns"] == 2
+
+    def test_new_thread_flag_navigates_home_in_same_tab(self):
+        drv = ConsoleFakeDriver(
+            share_tab=True,
+            url="https://www.perplexity.ai/search/old-thread",
+        )
+        drv.bubbles = ["旧问题\n13:39"]
+        drv.prose = ["旧答案"]
+        drv.studied = 1
+        res = _ask(drv, "新任务问题", task="other", new_thread=True)
+        navs = [c for c in drv.calls if c[0] == "navigate"]
+        assert navs and navs[0][1] == BASE_URL and navs[0][2] is False
+        assert res["gates"]["fill"]["ok"]
+        assert res["url"].startswith("https://www.perplexity.ai/search/")
+        state = load_state()
+        assert state["threads"]["other"]["turns"] == 1
+        assert state["threads"]["other"]["label"] == "新任务问题"
+
+    def test_attach_error_when_extension_disconnected(self):
+        class Disconnected(ConsoleFakeDriver):
+            def list_tabs(self):
+                return {"ok": False, "error": {"message": "no extension connected"}}
+
+        with pytest.raises(ConsoleError) as excinfo:
+            _ask(Disconnected(), "q")
+        assert excinfo.value.gate == "attach"
+
+
+class TestSelfcheckAndStatus:
+    def test_selfcheck_reports_failure_dict(self):
+        drv = ConsoleFakeDriver(submit_disabled=True)
+        out = console_selfcheck(config=make_config(), driver=drv,
+                                wait_budget=0.5, poll_interval=0.01,
+                                submit_timeout=0.2, sleep=NOOP)
+        assert out["ok"] is False
+        assert out["gate"] == "submit"
+
+    def test_status_readback(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        st = console_status(config=make_config(), driver=drv)
+        assert st["live"]["tabs"] == 1
+        assert st["live"]["on_thread"] is False
+        assert console_threads()["threads"] == {}
+
+
+class TestHelpers:
+    def test_bubble_owns_requires_equality_or_prefix(self):
+        assert _bubble_owns("那德国呢？\n13:20", "那德国呢？")
+        assert _bubble_owns("用一句话回答：法国的首都是哪里？\n13:18",
+                            "用一句话回答：法国的首都是哪里？")
+        assert not _bubble_owns("13:18", "x")
+        # extra text BEFORE the query is a polluted submission, not an owner
+        assert not _bubble_owns("用一句话回答：法国的首都是哪里？ 13:18", "法国的首都是哪里")
+        # a polluted bubble that merely CONTAINS the query must not pass
+        assert not _bubble_owns("用一句话回答：法国的首都是哪里？\n用一句话回答：1+1 等于几？\n13:25",
+                                "用一句话回答：1+1 等于几？")
+
+    def test_url_matches(self):
+        assert _url_matches("https://www.perplexity.ai/", BASE_URL)
+        assert not _url_matches("https://www.perplexity.ai/search/x", BASE_URL)
+        assert _url_matches("https://www.perplexity.ai/search/x",
+                            "https://www.perplexity.ai/search/x")

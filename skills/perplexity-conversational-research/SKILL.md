@@ -141,6 +141,17 @@ curl -s -X POST http://127.0.0.1:10086/command \
 sleep 15-20
 ```
 
+### Resident console (lock one group for Perplexity)
+
+The default way to satisfy "lock one group for Perplexity" is the toolkit's resident console — one WebBridge session `perplexity-console` = one group «Perplexity 控制台» = one tab; one task = one thread:
+
+```bash
+perplexity console ask "query" --task <task> [--new-thread] [-f json]
+perplexity console status | threads | selfcheck
+```
+
+Continuation semantics: same task → follow-up in the same thread; a new task or `--new-thread` → a fresh thread in the same tab (home → submit). State (per-task thread URLs) persists in `~/.perplexity-console/state.json`, so daemon/browser restarts do not break continuity. Every step is gated (fill equality → user-turn ownership → completion signals → turn-scoped extraction) with loud, evidence-bearing failures. When the console is unavailable, fall back to the manual recipe below.
+
 ### Fixed group + one-tab variant
 
 When the user explicitly asks for one fixed group/tab, do not use an explicit

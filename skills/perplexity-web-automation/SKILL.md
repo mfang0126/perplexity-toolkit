@@ -3,7 +3,7 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.1.2"
+  version: "0.1.3"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 
@@ -118,6 +118,21 @@ curl -s -X POST http://127.0.0.1:10086/command \
 
 Keep the direct URLs from the page. Record unavailable, paywalled, or contradictory sources explicitly.
 
+### 4a. Candidate-selection evidence (mandatory for “which is better?”)
+
+When Perplexity is used to compare, recommend, shortlist, or assess maturity/adoption, do **not** ask only for features and links. Put the evidence fields in the Perplexity prompt and extract them separately:
+
+```text
+For every candidate, provide direct URLs and an as-of date for:
+- GitHub stars/forks and a second adoption signal (package downloads, dependents, registry installs, or public production references)
+- latest release and latest commit; contributor concentration and a small issue/PR responsiveness sample
+- two independent community discussions: date, net votes/replies, author affiliation, and concrete success/failure evidence
+- security/permission model and whether a secret can enter LLM context
+- exact unknowns. Do not convert missing data into a ranking.
+```
+
+Perplexity's metrics and source labels are discovery leads, not verified facts. For finalists, read the canonical repository/registry/official document, record the metric capture date, and preserve `ui_source_count`, `unique_dom_urls`, and canonical-readback status separately. Do not report “popular”, “active”, “many users”, or “best” without the raw indicator and its scope.
+
 The candidate-vs-verified boundary (Perplexity's answer and source labels are candidate output; a claim becomes verified only after canonical page readback) is defined once in Step 3 (Verification) of the `perplexity-search` skill. Apply that definition; do not restate it here. Note that this skill is the low-level browser layer — a `perplexity` CLI/toolkit route also exists; see the `perplexity-conversational-research` skill for when to prefer it.
 
 ```bash
@@ -158,6 +173,27 @@ curl -s -X POST http://127.0.0.1:10086/command \
 # Submit with the three-event Enter sequence from Step 1.
 ```
 
+## Resident console (recommended for repeat / multi-turn use)
+
+For a fixed group+tab workflow, prefer the toolkit's resident console over hand-driving the raw steps:
+
+```bash
+perplexity console ask "query" [--task NAME] [--new-thread] [-f json]   # one task = one thread
+perplexity console status                                              # state + live readback
+perplexity console threads                                             # recorded task threads
+perplexity console selfcheck                                           # canned full-gate run
+```
+
+Conventions: WebBridge session `perplexity-console`, group «Perplexity 控制台», exactly one tab. Durable state lives in `~/.perplexity-console/state.json` (session, group, per-task thread URL) because session→tab mappings are daemon-memory only and die on daemon restart — the console attach-or-recreates by reopening the saved thread URL. Every step carries a readback gate; failures raise with a screenshot under `~/.perplexity-console/evidence/`.
+
+Live-verified UI behaviors (2026-09; bake these into any direct-browser flow):
+
+- The composer is a controlled React editor. `fill` (clear-and-insert) is its ONLY reliable mutation path; CDP key events, execCommand and DOM/range edits get reverted by re-render, and empty/whitespace fill values are silent no-ops.
+- `fill` can also silently no-op on a fresh/unfocused editor while returning `success: true` — always read the composer back.
+- The submit button is `button[aria-label="提交"]`; its `disabled` flag mirrors the editor's internal state (disabled = state empty even if the DOM shows text). Verify `enabled` before clicking; a DOM/state desync (DOM shows text, button disabled) is healed by one page reload.
+- A late async draft-restore can merge old draft text into the composer AFTER a successful fill; the submission then carries draft+query (seen live). Re-verify composer equality immediately before submitting; repair by re-filling (fill replaces).
+- Per-turn scoping (never use `main.innerText` in a thread): user turns = `[class*="user-bubble"]` filtered `:not(.opacity-0)` (text = query + "\nHH:MM"); completion marker = one `已研究` pill per answered turn (count increments); the answer body = the LAST `main div.prose` (one per turn). The expand control in the new UI is a button labeled 「展开」 (the legacy 「查看更多」 did not appear in live mapping).
+
 ## Key DOM Patterns
 
 | Element | Selector Strategy | Notes |
@@ -188,13 +224,17 @@ The CDP `Input.insertText` fallback (used when `fill` fails) applies to the **in
 
 ## Known Limitations
 
-1. **Answer truncation**: Answers are collapsed by default; must click "查看更多"
+1. **Answer truncation**: long answers arrive collapsed behind a fade mask; click the 「展开」 control (new UI; legacy label "查看更多") — and scope extraction to the LAST `div.prose` so earlier thread turns never leak into the answer
 2. **Element refs change**: Every session gets different @e refs; use role+name or JS selectors
 3. **Model dropdown**: React synthetic events; may need CDP for model switching
 4. **Rate limits**: Perplexity Pro has usage limits; batch carefully
 5. **No Deep Research automation yet**: Need to map the Deep Research UI flow
 6. **Focus modes not mapped**: Academic, Writing, Math modes need exploration
 7. **File upload not mapped**: Need to explore the upload flow
+8. **Fill is the only reliable editor mutation path** — keyboard/CDP/DOM edits are reverted by the controlled re-render, empty fills are no-ops, and a fill can silently no-op while reporting success. Read the composer back and require equality.
+9. **Draft-restore merge**: a late async draft restore can merge leftover draft text into a successfully-filled composer; the submitted message then contains draft+query. Re-verify the composer immediately before submit and re-fill on mismatch.
+10. **DOM/state desync**: the editor's visible text can disagree with its internal state (submit button disabled while the DOM shows text). Use the submit button's `disabled` flag as the state signal, and heal with a single page reload.
+11. **Thread extraction scoping**: in a multi-turn thread `main.innerText` contains the whole conversation; extract only the last `div.prose` and identify turns via `user-bubble` + `已研究` counts.
 
 ## Session Management
 
