@@ -218,7 +218,7 @@ and report "not resolved in this environment" rather than "not installed".
 
 ## Research
 
-See `docs/research/` for comprehensive analysis of Perplexity's known issues, API vs web gap, and browser automation mapping.
+See `docs/research/` for comprehensive analysis of Perplexity's known issues, API vs web gap, and browser automation mapping. [`docs/reference-pro-guide.md`](docs/reference-pro-guide.md) is a practical Perplexity Pro playbook (model-picking strategy, features, limits; snapshot 2026-08-30).
 
 ## License
 
