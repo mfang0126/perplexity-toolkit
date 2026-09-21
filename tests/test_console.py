@@ -8,8 +8,14 @@ models the live-mapped perplexity.ai behavior:
   whitespace-only fill values are silent no-ops (observed live);
 - a late async draft-restore can merge extra text into the composer after a
   successful fill (observed live: a merged draft+query produced a polluted
-  submission — the console must refill before submitting).
+  submission — the console must refill before submitting);
+- the model selector is a Radix portal: only trusted CDP mouse clicks open
+  the menu / select rows (synthetic clicks do nothing);
+- files attach by in-page File construction (DataTransfer + change event),
+  and every attachment must surface as a "移除 <name>" chip.
 """
+import json
+import re
 import sys; sys.path.insert(0, "src")
 
 import pytest
@@ -21,7 +27,9 @@ from perplexity_toolkit.console import (
     _bubble_owns,
     _url_matches,
     console_ask,
+    console_models,
     console_selfcheck,
+    console_set_model,
     console_status,
     console_threads,
     load_state,
@@ -74,6 +82,24 @@ class ConsoleFakeDriver(BrowserDriver):
         self._info_calls = 0
         self._race_applied = False
         self._submit_clicks = 0
+        self.model = "Gemini 3.8 Flash"
+        self.model_menu_open = False
+        self.model_rows = [
+            ("最佳", False),
+            ("GPT-5.6 Terra", False),
+            ("Gemini 3.8 Flash", False),
+            ("Claude Sonnet 5", False),
+            ("GPT-5.6 Sol", True),
+            ("GLM 5.3", False),
+        ]
+        self.attachments = []
+        self.inject_fail = False
+        self.answer_delay_samples = 0
+        self._pending_answer = False
+        self._info_after_submit = 0
+        self.misfire_until_reload = False
+        self.pollute_first_fill = False
+        self._polluted_once = False
 
     def _btn_state(self):
         """The submit button mirrors the editor's internal state."""
@@ -100,6 +126,7 @@ class ConsoleFakeDriver(BrowserDriver):
         self.url = url.rstrip("/") or BASE_URL
         self.tab_url = self.url
         self.editor_desynced = False  # a reload resets the editor
+        self.misfire_until_reload = False  # a reload resets the misfire mode
         if url.rstrip("/") == BASE_URL.rstrip("/"):
             self.bubbles = []
             self.prose = []
@@ -122,7 +149,12 @@ class ConsoleFakeDriver(BrowserDriver):
         if self._fill_noops < self.fill_noop_first:
             self._fill_noops += 1
             return {"ok": True, "data": {"success": True, "mode": "contenteditable"}}
-        if self.fill_appends:
+        if self.pollute_first_fill and not self._polluted_once:
+            # the first fill merges into existing content (draft-merge race);
+            # every later fill replaces properly, so a re-fill heals it
+            self._polluted_once = True
+            self.composer = self.composer + value
+        elif self.fill_appends:
             self.composer = self.composer + value
         else:
             self.composer = value
@@ -132,6 +164,21 @@ class ConsoleFakeDriver(BrowserDriver):
         self.calls.append(("cdp", method, params))
         if method == "Input.insertText" and params:
             self.composer = params.get("text", "")
+        elif method == "Input.dispatchMouseEvent" and params:
+            if params.get("type") == "mousePressed":
+                x = int(params.get("x") or 0)
+                y = int(params.get("y") or 0)
+                if not self.model_menu_open and abs(x - 845) < 5 and abs(y - 956) < 5:
+                    self.model_menu_open = True
+                elif self.model_menu_open:
+                    for i, (name, sub) in enumerate(self.model_rows):
+                        if abs(y - (600 + i * 36)) <= 12:
+                            if not sub:
+                                self.model = name
+                            break
+                    self.model_menu_open = False
+        elif method == "Input.dispatchKeyEvent" and params and params.get("key") == "Escape":
+            self.model_menu_open = False
         return {"ok": True}
 
     def evaluate(self, code):
@@ -146,11 +193,19 @@ class ConsoleFakeDriver(BrowserDriver):
                 # late async draft-restore merges extra text into the composer
                 self.composer = self.race_draft_text + "\n" + self.composer
                 self._race_applied = True
+            if self._pending_answer:
+                self._info_after_submit += 1
+                if self._info_after_submit >= self.answer_delay_samples:
+                    self._pending_answer = False
+                    if self.studied_on_submit:
+                        self.studied += 1
+                    self.prose.append(self.answer)
             return {
                 "url": self.url,
                 "title": "Perplexity",
                 "composer": self.composer,
                 "submit_button": self._btn_state(),
+                "model": self.model,
                 "bubbles": len(self.bubbles),
                 "lastBubble": self.bubbles[-1] if self.bubbles else "",
                 "studied": self.studied,
@@ -158,6 +213,27 @@ class ConsoleFakeDriver(BrowserDriver):
                 "proseCount": len(self.prose),
                 "lastProseLen": len(self.prose[-1]) if self.prose else 0,
             }
+        if "atob(" in code:
+            if self.inject_fail:
+                return {"ok": False, "why": "scripted-failure"}
+            m = re.search(r'new File\(\[arr\],\s*("(?:[^"\\]|\\.)*")', code)
+            name = json.loads(m.group(1)) if m else "file.bin"
+            self.attachments.append(name)
+            return {"ok": True, "count": len(self.attachments), "size": 1}
+        if "[role=menu]" in code:
+            if not self.model_menu_open:
+                return {"open": False, "rows": []}
+            rows = [{"name": n, "badges": [],
+                     "role": "menuitem" if sub else "menuitemradio",
+                     "checked": (n == self.model), "submenu": sub,
+                     "x": 780, "y": 600 + i * 36, "vis": True}
+                    for i, (n, sub) in enumerate(self.model_rows)]
+            return {"open": True, "rows": rows}
+        if "移除 " in code:
+            return {"attachments": list(self.attachments)}
+        if "aria-haspopup" in code:
+            return {"found": True, "label": self.model,
+                    "expanded": self.model_menu_open, "x": 845, "y": 956}
         if "a[href]" in code:
             return [{"text": "src", "href": "https://example.com/x"}]
         if "提交" in code:
@@ -182,12 +258,27 @@ class ConsoleFakeDriver(BrowserDriver):
             return
         if self.bubbles and self.bubbles[-1].startswith(query):
             return  # idempotent: this query is already the last turn
+        if self.misfire_until_reload:
+            # reproduce the live file-only misfire: the attachment (not the
+            # text) gets sent until a page reload clears the bad state
+            name = self.attachments[0] if self.attachments else "attachment"
+            if not (self.bubbles and self.bubbles[-1].startswith(name)):
+                self.bubbles.append(name + "\n13:40")
+            self.attachments = []
+            return
         self.bubbles.append(query + "\n13:40")
+        self.attachments = []
         if self.composer_clears:
             self.composer = ""
-        if self.studied_on_submit:
-            self.studied += 1
-        self.prose.append(self.answer)
+        if self.answer_delay_samples:
+            # a slow answer: the new prose shows up only after N info polls,
+            # so a naive stability check on the PREVIOUS answer must not pass
+            self._pending_answer = True
+            self._info_after_submit = 0
+        else:
+            if self.studied_on_submit:
+                self.studied += 1
+            self.prose.append(self.answer)
         self.url = "https://www.perplexity.ai/search/fake-thread-1"
         self.tab_url = self.url
 
@@ -206,11 +297,11 @@ def tmp_console_home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _ask(drv, query, *, task="default", new_thread=False, wait_budget=1.0,
-         poll_interval=0.01, submit_timeout=0.4, sleep=NOOP):
-    return console_ask(query, task=task, new_thread=new_thread,
+def _ask(drv, query, *, task="default", new_thread=False, files=None,
+         wait_budget=1.0, poll_interval=0.01, submit_timeout=0.4, sleep=NOOP):
+    return console_ask(query, task=task, new_thread=new_thread, files=files,
                        wait_budget=wait_budget, poll_interval=poll_interval,
-                       submit_timeout=submit_timeout,
+                       submit_timeout=submit_timeout, submit_recheck_timeout=0.1,
                        config=make_config(), driver=drv, sleep=sleep)
 
 
@@ -264,15 +355,16 @@ class TestConsoleAsk:
         assert drv.bubbles[0].split("\n")[0] == "q-草稿竞态"
         assert not any("旧草稿" in b for b in drv.bubbles)
 
-    def test_fill_pollution_recovers_after_reload(self):
-        # A polluted composer (fill merging into leftovers) now self-heals:
-        # the bounded reload resets the editor and the retry produces a clean
-        # query — the submitted bubble must carry ONLY the query.
-        drv = ConsoleFakeDriver(share_tab=True, url=BASE_URL, fill_appends=True)
+    def test_fill_pollution_heals_by_refill(self):
+        # The first fill merges into existing content (draft-merge race);
+        # a later replace heals it and the submitted bubble carries ONLY the
+        # query — no reload needed here.
+        drv = ConsoleFakeDriver(share_tab=True, url=BASE_URL)
         drv.composer = "残留"
+        drv.pollute_first_fill = True
         res = _ask(drv, "q-污染")
         assert res["ok"]
-        assert res["gates"]["fill"].get("recovered") == "reload"
+        assert res["gates"]["fill"]["composer_before"] == "残留"
         assert drv.bubbles and drv.bubbles[0].startswith("q-污染")
         assert not any("残留" in b for b in drv.bubbles)
 
@@ -280,7 +372,8 @@ class TestConsoleAsk:
         drv = ConsoleFakeDriver(button_submit_works=False)
         res = _ask(drv, "q-提交兜底")
         actions = [a["action"] for a in res["gates"]["submit"]["actions"]]
-        assert actions == ["composer-verified", "click-submit-button", "enter-combo"]
+        assert actions == ["composer-verified", "composer-refresh",
+                           "click-submit-button", "enter-combo"]
         assert res["gates"]["submit"]["mechanism"] == "combo"
         assert res["gates"]["submit"]["ok"]
 
@@ -288,9 +381,34 @@ class TestConsoleAsk:
         drv = ConsoleFakeDriver(btn_missing_first_click=1)
         res = _ask(drv, "q-点击重试")
         actions = [a["action"] for a in res["gates"]["submit"]["actions"]]
-        assert actions == ["composer-verified", "click-submit-button",
-                           "click-submit-button-retry"]
+        assert actions == ["composer-verified", "composer-refresh",
+                           "click-submit-button", "click-submit-button-retry"]
         assert res["gates"]["submit"]["mechanism"] == "button"
+
+    def test_submit_misfire_recovers_after_reload(self, tmp_path):
+        # reproduce the live file-only misfire: the first submits send only
+        # the attachment until a page reload; the pipeline must recover and
+        # end with exactly one correct owning turn
+        f = tmp_path / "console-attach-test.txt"
+        f.write_text("42", encoding="utf-8")
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 1,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        drv.bubbles = ["旧问题\n13:39"]
+        drv.prose = ["旧答案"]
+        drv.studied = 1
+        drv.misfire_until_reload = True
+        res = _ask(drv, "文件里的数字", files=[str(f)])
+        assert res["ok"]
+        assert res["gates"]["submit"].get("recovered") == "reload"
+        assert sum(1 for b in drv.bubbles if b.startswith("文件里的数字")) == 1
+        assert res["answer"] == "答案 42。"
 
     def test_editor_state_desync_fails_loudly(self):
         # DOM shows the query but the editor state never commits (submit
@@ -377,7 +495,8 @@ class TestSelfcheckAndStatus:
         drv = ConsoleFakeDriver(submit_disabled=True)
         out = console_selfcheck(config=make_config(), driver=drv,
                                 wait_budget=0.5, poll_interval=0.01,
-                                submit_timeout=0.2, sleep=NOOP)
+                                submit_timeout=0.2, submit_recheck_timeout=0.1,
+                                sleep=NOOP)
         assert out["ok"] is False
         assert out["gate"] == "submit"
 
@@ -406,3 +525,93 @@ class TestHelpers:
         assert not _url_matches("https://www.perplexity.ai/search/x", BASE_URL)
         assert _url_matches("https://www.perplexity.ai/search/x",
                             "https://www.perplexity.ai/search/x")
+
+
+class TestModels:
+    def test_models_list_and_close(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        res = console_models(config=make_config(), driver=drv, sleep=NOOP)
+        assert res["ok"]
+        assert res["current"] == "Gemini 3.8 Flash"
+        names = [m["name"] for m in res["models"]]
+        assert "Claude Sonnet 5" in names and "GLM 5.3" in names
+        checked = [m["name"] for m in res["models"] if m["checked"]]
+        assert checked == ["Gemini 3.8 Flash"]
+        assert res["menu_closed"] is True
+        assert drv.model_menu_open is False
+
+    def test_set_model_switch_and_partial_match(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        res = console_set_model("claude sonnet 5", config=make_config(),
+                                driver=drv, sleep=NOOP)
+        assert res["ok"] and res["to"] == "Claude Sonnet 5"
+        assert res["from"] == "Gemini 3.8 Flash"
+        assert drv.model == "Claude Sonnet 5"
+        res2 = console_set_model("Gemini 3.8", config=make_config(),
+                                 driver=drv, sleep=NOOP)
+        assert res2["to"] == "Gemini 3.8 Flash"
+
+    def test_set_model_not_found(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        with pytest.raises(ConsoleError) as excinfo:
+            console_set_model("nope 9000", config=make_config(), driver=drv, sleep=NOOP)
+        assert excinfo.value.gate == "model"
+        assert "available:" in str(excinfo.value)
+        assert drv.model_menu_open is False
+
+    def test_set_model_submenu_rejected(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        with pytest.raises(ConsoleError) as excinfo:
+            console_set_model("GPT-5.6 Sol", config=make_config(), driver=drv, sleep=NOOP)
+        assert "submenu" in str(excinfo.value)
+        assert drv.model == "Gemini 3.8 Flash"
+
+
+class TestAskFiles:
+    def test_ask_with_files_injects_verifies_and_sends(self, tmp_path):
+        f = tmp_path / "console-attach-test.txt"
+        f.write_text("42", encoding="utf-8")
+        drv = ConsoleFakeDriver()
+        res = _ask(drv, "文件里的数字是多少", files=[str(f)])
+        assert res["ok"]
+        assert res["attachments"] == ["console-attach-test.txt"]
+        assert res["gates"]["files"]["ok"]
+        assert res["gates"]["send"]["chips_cleared"] is True
+        assert drv.attachments == []  # consumed by the submitted message
+
+    def test_ask_file_missing_raises(self):
+        drv = ConsoleFakeDriver()
+        with pytest.raises(ConsoleError) as excinfo:
+            _ask(drv, "q", files=["/definitely/not/here.txt"])
+        assert excinfo.value.gate == "file"
+
+    def test_ask_file_injection_failure_raises(self, tmp_path):
+        f = tmp_path / "x.txt"
+        f.write_text("1", encoding="utf-8")
+        drv = ConsoleFakeDriver()
+        drv.inject_fail = True
+        with pytest.raises(ConsoleError) as excinfo:
+            _ask(drv, "q", files=[str(f)])
+        assert excinfo.value.gate == "file"
+
+    def test_completion_waits_for_new_answer_not_stale(self):
+        # The previous turn's answer must never satisfy the completion gate:
+        # the new turn's prose has to appear first (slow-answer race observed
+        # live 2026-09-21 when a file-bearing answer rendered late).
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 1,
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        drv.prose = ["旧答案"]
+        drv.bubbles = ["旧问题\n13:39"]
+        drv.studied = 1
+        drv.answer_delay_samples = 6
+        res = _ask(drv, "数字是多少")
+        assert res["ok"]
+        assert res["answer"] == "答案 42。"  # NOT the stale 旧答案
+        assert res["gates"]["complete"]["new_seen"] is True

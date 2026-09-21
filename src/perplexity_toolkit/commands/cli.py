@@ -26,16 +26,49 @@ def cmd_route(args) -> int:
 
 def cmd_console(args) -> int:
     """Resident Perplexity console actions."""
-    from ..console import (ConsoleError, console_ask, console_selfcheck,
+    from ..console import (ConsoleError, console_ask, console_models,
+                           console_selfcheck, console_set_model,
                            console_status, console_threads)
     action = getattr(args, "console_action", None)
     fmt = getattr(args, "format", "text")
+
+    if action in ("models", "model"):
+        try:
+            payload = (console_models() if action == "models"
+                       else console_set_model(args.name))
+        except ConsoleError as exc:
+            payload = {"ok": False, "gate": exc.gate, "error": exc.message,
+                       "evidence": exc.evidence, "gates": exc.gates}
+            if fmt == "json":
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"FAILED at gate: {exc.gate}")
+                print(f"  {exc.message}")
+                if exc.evidence:
+                    print(f"  evidence: {exc.evidence}")
+            return 1
+        if fmt == "json":
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            if action == "models":
+                print(f"current: {payload['current']}")
+                for m in payload["models"]:
+                    mark = "*" if m["checked"] else " "
+                    badges = f"  [{'/'.join(m['badges'])}]" if m["badges"] else ""
+                    sub = "  (submenu)" if m["submenu"] else ""
+                    print(f"{mark} {m['name']}{badges}{sub}")
+                print(f"menu_closed: {payload.get('menu_closed')}")
+            else:
+                print(f"switched: {payload['from']} -> {payload['to']} "
+                      f"(attempts={payload['attempts']})")
+        return 0
 
     if action == "ask":
         try:
             result = console_ask(args.query, task=args.task,
                                  new_thread=args.new_thread,
-                                 wait_budget=args.wait_budget)
+                                 wait_budget=args.wait_budget,
+                                 files=getattr(args, "file", None))
         except ConsoleError as exc:
             payload = {"ok": False, "gate": exc.gate, "error": exc.message,
                        "evidence": exc.evidence, "gates": exc.gates}
@@ -55,6 +88,8 @@ def cmd_console(args) -> int:
             print(f"task: {result['task']}  session: {result['session']}"
                   f"  new_thread: {result['new_thread']}  elapsed: {result['elapsed_s']}s")
             print(f"url: {result['url']}")
+            print(f"model: {result.get('model') or '-'}  "
+                  f"attachments: {', '.join(result.get('attachments') or []) or '-'}")
             print(f"sources: {len(result['sources'])}")
             gate_bits = []
             for name, value in result["gates"].items():
@@ -299,6 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0,
                     help="Completion budget in seconds")
+    pc.add_argument("--file", action="append", metavar="PATH",
+                    help="Attach a local file to the message (repeatable; <=8MB)")
     pc = csub.add_parser("status", help="Show console state and live tab readback")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc = csub.add_parser("threads", help="List known task threads")
@@ -306,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
     pc = csub.add_parser("selfcheck", help="Run the full gate pipeline on a canned query")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0)
+    pc = csub.add_parser("models", help="List selectable Perplexity models")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc = csub.add_parser("model", help="Switch the composer model (verified readback)")
+    pc.add_argument("name")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
 
     return parser
 

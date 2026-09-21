@@ -37,9 +37,11 @@ Design (live-mapped against the perplexity.ai web UI, 2026-09-21):
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -73,10 +75,14 @@ _JS_INFO = r"""(() => {
   const main = document.querySelector('main');
   const prose = main ? Array.from(main.querySelectorAll('div.prose')) : [];
   const ce = document.querySelector('[contenteditable]');
+  const area = ce ? (ce.closest('form') || ce.parentElement.parentElement.parentElement.parentElement) : document.body;
+  const modelBtns = Array.from(area.querySelectorAll('button')).filter(b => b.getAttribute('aria-haspopup') === 'menu' && (b.getAttribute('aria-label') || '').length > 0 && !/添加文件或工具|草稿/.test(b.getAttribute('aria-label')));
+  const modelBtn = modelBtns.length ? modelBtns[modelBtns.length - 1] : null;
   return JSON.stringify({
     url: location.href,
     title: document.title,
     composer: ce ? String(ce.innerText || '') : '',
+    model: modelBtn ? (modelBtn.getAttribute('aria-label') || '') : '',
     submit_button: (() => { const b = document.querySelector('button[aria-label="提交"]'); return b ? (b.disabled ? 'disabled' : 'enabled') : 'missing'; })(),
     bubbles: bubbles.length,
     lastBubble: bubbles.length ? String(bubbles[bubbles.length - 1].innerText || '').slice(0, 300) : '',
@@ -144,6 +150,54 @@ _JS_EXPAND = r"""(() => {
   if (!btns.length) return 'none';
   btns[btns.length - 1].click();
   return 'clicked';
+})()"""
+
+_JS_MODEL_BTN = r"""(() => {
+  const ce = document.querySelector('[contenteditable]');
+  const area = ce ? (ce.closest('form') || ce.parentElement.parentElement.parentElement.parentElement) : document.body;
+  const cands = Array.from(area.querySelectorAll('button')).filter(b => b.getAttribute('aria-haspopup') === 'menu' && (b.getAttribute('aria-label') || '').length > 0 && !/添加文件或工具|草稿/.test(b.getAttribute('aria-label')));
+  const b = cands.length ? cands[cands.length - 1] : null;
+  if (!b) return JSON.stringify({found: false});
+  const r = b.getBoundingClientRect();
+  return JSON.stringify({found: true, label: b.getAttribute('aria-label') || String(b.innerText || '').trim(),
+    expanded: b.getAttribute('aria-expanded') === 'true',
+    x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)});
+})()"""
+
+_JS_MODEL_MENU = r"""(() => {
+  const menu = document.querySelector('[role=menu]');
+  if (!menu) return JSON.stringify({open: false, rows: []});
+  const rows = Array.from(menu.querySelectorAll('[data-radix-collection-item], [role^=menuitem]')).map(r => {
+    const b = r.getBoundingClientRect();
+    const parts = String(r.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+    return {name: parts[0] || '', badges: parts.slice(1),
+            role: r.getAttribute('role'), checked: r.getAttribute('aria-checked') === 'true',
+            submenu: r.getAttribute('role') === 'menuitem',
+            x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2),
+            vis: !!r.offsetParent};
+  });
+  return JSON.stringify({open: true, rows: rows});
+})()"""
+
+_JS_CHIPS = r"""(() => {
+  const labels = Array.from(document.querySelectorAll('button'))
+    .map(b => b.getAttribute('aria-label') || '')
+    .filter(a => a.indexOf('移除 ') === 0)
+    .map(a => a.slice(3));
+  return JSON.stringify({attachments: labels});
+})()"""
+
+_JS_INJECT_FILE = r"""(() => {
+  const input = document.querySelector('input[type=file]');
+  if (!input) return JSON.stringify({ok: false, why: 'no-input'});
+  const bin = atob(__B64__);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  const dt = new DataTransfer();
+  dt.items.add(new File([arr], __NAME__, {type: __MIME__}));
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change', {bubbles: true}));
+  return JSON.stringify({ok: true, count: input.files.length, size: arr.length});
 })()"""
 
 
@@ -315,6 +369,27 @@ def _evidence(driver: Any) -> Optional[str]:
         return None
 
 
+def _cdp_click(driver: Any, x: int, y: int, *, sleep: Callable[[float], None]) -> None:
+    """Trusted mouse click via CDP — required for Radix portal menus, where
+    synthetic .click() does nothing (menu items are portals outside the
+    composer subtree; plain button chips DO respond to synthetic clicks)."""
+    driver.cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    sleep(0.08)
+    driver.cdp("Input.dispatchMouseEvent",
+               {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+    sleep(0.12)
+    driver.cdp("Input.dispatchMouseEvent",
+               {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+
+
+def _press_escape(driver: Any, *, sleep: Callable[[float], None]) -> None:
+    for kind in ("keyDown", "keyUp"):
+        driver.cdp("Input.dispatchKeyEvent",
+                   {"type": kind, "key": "Escape", "code": "Escape",
+                    "windowsVirtualKeyCode": 27, "nativeVirtualKeyCode": 27})
+        sleep(0.12)
+
+
 def _make_driver(cfg: Config, state: dict) -> Any:
     from .drivers.webbridge import WebBridgeDriver
     return WebBridgeDriver(cfg.webbridge_url, session=state.get("session") or DEFAULT_SESSION)
@@ -448,14 +523,29 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
     button (multi-selector), falling back to the Enter combo.
     """
     actions = []
+    qn = _normalize(query)
     sync = _info(driver)
-    if (_normalize(sync.get("composer")) != _normalize(query)
+    if (_normalize(sync.get("composer")) != qn
             or sync.get("submit_button") != "enabled"):
         refill = _gate_fill(driver, query, sleep=sleep)
         actions.append({"action": "refill-before-submit", "result": refill["method"],
                         "composer_before": refill.get("composer_before", "")[:80]})
     else:
         actions.append({"action": "composer-verified", "result": "equal"})
+
+    # Freshness pass: one final replace right before sending so the editor
+    # state is committed at submit time. An attachment can keep the submit
+    # button enabled while the text state lags, which once produced a
+    # file-only submission (observed live 2026-09-21).
+    driver.fill("[contenteditable]", query)
+    sleep(FILL_SETTLE)
+    fresh = _info(driver)
+    if (_normalize(fresh.get("composer")) != qn
+            or fresh.get("submit_button") != "enabled"):
+        refill = _gate_fill(driver, query, sleep=sleep)
+        actions.append({"action": "refill-after-refresh", "result": refill["method"]})
+    else:
+        actions.append({"action": "composer-refresh", "result": "ok"})
 
     clicked = _js(driver, _JS_CLICK_SUBMIT, "no-button")
     actions.append({"action": "click-submit-button", "result": clicked})
@@ -474,17 +564,26 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
     if _wait_ownership(driver, query, base_bubbles, timeout=timeout, poll=poll, sleep=sleep):
         return {"ok": True, "mechanism": "combo", "actions": actions}
 
-    raise ConsoleError("submit", "no new user turn observed after submit attempts",
-                       evidence=_evidence(driver))
+    last = _info(driver).get("lastBubble") or ""
+    raise ConsoleError(
+        "submit",
+        f"no new user turn observed after submit attempts (last bubble: {str(last)[:80]!r})",
+        evidence=_evidence(driver))
 
 
 def _gate_complete(driver: Any, base_studied: int, *,
+                   base_prose_count: int = 0,
                    wait_budget: float, poll: float,
                    sleep: Callable[[float], None]) -> dict:
-    """Gate 3: studied-pill count up AND the latest answer text stable.
+    """Gate 3: the NEW turn's answer must appear, then settle.
 
-    Falls back to text stability alone when the studied pill never appears.
+    A stale answer from the previous turn must never satisfy this gate: the
+    turn-scoped answer count (``proseCount``) has to grow beyond the
+    pre-submit baseline before stability counts (observed live 2026-09-21:
+    a slow file-bearing answer let a naive stability check extract the
+    previous turn's answer).
     """
+    new_seen = False
     done_seen = False
     stable = 0
     last_len = -1
@@ -493,25 +592,29 @@ def _gate_complete(driver: Any, base_studied: int, *,
         info = _info(driver)
         if int(info.get("studied") or 0) > base_studied:
             done_seen = True
+        if int(info.get("proseCount") or 0) > base_prose_count:
+            new_seen = True
         length = int(info.get("lastProseLen") or 0)
-        stable = stable + 1 if (length > 0 and length == last_len) else 0
+        stable = stable + 1 if (new_seen and length > 0 and length == last_len) else 0
         last_len = length
-        if stable >= 1 and done_seen:
+        if new_seen and stable >= 1 and done_seen:
             break
-        if stable >= 2:
+        if new_seen and stable >= 2:
             break
         if time.monotonic() >= deadline:
             break
         sleep(max(poll, 0.01))
 
     method = "pill+stable" if done_seen else ("stable-only" if stable >= 2 else "none")
-    ok = last_len > 0 and stable >= 1
-    result = {"ok": ok, "done_seen": done_seen, "stable": stable,
+    ok = new_seen and last_len > 0 and stable >= 1
+    result = {"ok": ok, "new_seen": new_seen, "done_seen": done_seen, "stable": stable,
               "chars": last_len, "method": method}
     if not ok:
         result["evidence"] = _evidence(driver)
-        raise ConsoleError("complete", f"answer never settled (method={method})",
-                           gates={"complete": result})
+        raise ConsoleError(
+            "complete",
+            f"new turn's answer never settled (new_seen={new_seen}, method={method})",
+            gates={"complete": result})
     return result
 
 
@@ -519,9 +622,177 @@ def _gate_complete(driver: Any, base_studied: int, *,
 # Main entry points
 # ──────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────
+# Model selector + file attachments
+# ──────────────────────────────────────────────────────────────
+
+def _model_button(driver: Any) -> dict:
+    btn = _js(driver, _JS_MODEL_BTN, {})
+    return btn if isinstance(btn, dict) else {}
+
+
+def _open_model_menu(driver: Any, *, sleep: Callable[[float], None],
+                     attempts: int = 2) -> dict:
+    """Open the model selector menu and return its rows (menu left OPEN).
+
+    The menu is a Radix portal: synthetic .click() does nothing, a trusted
+    CDP mouse click works (verified live 2026-09-21).
+    """
+    button = _model_button(driver)
+    if not button.get("found"):
+        raise ConsoleError("model", "model selector button not found in the composer")
+    menu = _js(driver, _JS_MODEL_MENU, {})
+    for _ in range(attempts):
+        if isinstance(menu, dict) and menu.get("open"):
+            break
+        _cdp_click(driver, button["x"], button["y"], sleep=sleep)
+        sleep(1.2)
+        menu = _js(driver, _JS_MODEL_MENU, {})
+    if not isinstance(menu, dict) or not menu.get("open"):
+        raise ConsoleError("model", "model menu did not open after CDP clicks")
+    return {"button": button, "rows": menu.get("rows") or []}
+
+
+def _close_model_menu(driver: Any, *, sleep: Callable[[float], None]) -> bool:
+    menu = _js(driver, _JS_MODEL_MENU, {})
+    if not (isinstance(menu, dict) and menu.get("open")):
+        return True
+    _press_escape(driver, sleep=sleep)
+    sleep(0.4)
+    menu = _js(driver, _JS_MODEL_MENU, {})
+    return not (isinstance(menu, dict) and menu.get("open"))
+
+
+def _clean_rows(rows: list) -> list:
+    return [{"name": r.get("name") or "", "badges": r.get("badges") or [],
+             "checked": bool(r.get("checked")), "submenu": bool(r.get("submenu")),
+             "x": r.get("x"), "y": r.get("y")}
+            for r in rows]
+
+
+def _ensure_console_tab(driver: Any, state: dict, *, cfg: Config,
+                        sleep: Callable[[float], None]) -> None:
+    """Make sure the console session has a tab (no navigation if one exists)."""
+    if _tabs(driver):
+        return
+    driver.navigate(BASE_URL, new_tab=True, group_title=state["group_title"])
+    sleep(cfg.page_load_wait)
+
+
+def console_models(*, config: Optional[Config] = None, driver: Any = None,
+                   sleep: Callable[[float], None] = time.sleep) -> dict:
+    """List the selectable models (name/badges/checked) and the current one."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
+    opened = _open_model_menu(drv, sleep=sleep)
+    rows = _clean_rows(opened["rows"])
+    closed = _close_model_menu(drv, sleep=sleep)
+    current = next((r["name"] for r in rows if r["checked"]), None) \
+        or opened["button"].get("label") or ""
+    return {"ok": True, "current": current, "models": rows, "menu_closed": closed}
+
+
+def console_set_model(name: str, *, config: Optional[Config] = None, driver: Any = None,
+                      sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Switch the composer's model and VERIFY the new label before success."""
+    cfg = config or get_config()
+    state = load_state()
+    drv = driver or _make_driver(cfg, state)
+    _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
+    wanted = _normalize(name).casefold()
+    if not wanted:
+        raise ConsoleError("model", "empty model name")
+
+    def find_row(rows):
+        exact = [r for r in rows if _normalize(r.get("name", "")).casefold() == wanted]
+        if not exact:
+            exact = [r for r in rows if wanted in _normalize(r.get("name", "")).casefold()]
+        return exact[0] if exact else None
+
+    before = _model_button(drv).get("label")
+    opened = _open_model_menu(drv, sleep=sleep)
+    row = find_row(opened["rows"])
+    if row is None:
+        available = ", ".join(r.get("name", "?") for r in opened["rows"])
+        _close_model_menu(drv, sleep=sleep)
+        raise ConsoleError("model", f"model {name!r} not found; available: {available}")
+    if row.get("submenu"):
+        _close_model_menu(drv, sleep=sleep)
+        raise ConsoleError("model", f"{row.get('name')!r} is a submenu entry (not supported yet)")
+
+    label = ""
+    for attempt in (1, 2):
+        _cdp_click(drv, row["x"], row["y"], sleep=sleep)
+        sleep(1.5)
+        _close_model_menu(drv, sleep=sleep)
+        label = _model_button(drv).get("label") or ""
+        if wanted in _normalize(label).casefold():
+            return {"ok": True, "from": before, "to": label, "attempts": attempt}
+        if attempt == 1:
+            opened = _open_model_menu(drv, sleep=sleep)
+            row = find_row(opened["rows"]) or row
+    raise ConsoleError("model", f"switch to {name!r} not verified (selector shows {label!r})",
+                       evidence=_evidence(drv))
+
+
+MAX_INJECT_BYTES = 8 * 1024 * 1024  # larger files need the chrome://extensions file-access route
+
+
+def _inject_file(driver: Any, path: str) -> dict:
+    """Attach a local file by building it in-page (DataTransfer + File).
+
+    This bypasses Chrome's per-extension file access (off by default and not
+    toggleable by the extension itself); the WebBridge ``upload`` action
+    needs that permission, plain in-page File construction does not.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise ConsoleError("file", f"file not found: {path}")
+    data = p.read_bytes()
+    if len(data) > MAX_INJECT_BYTES:
+        raise ConsoleError(
+            "file",
+            f"{p.name} is {len(data)} bytes; in-page injection limit is {MAX_INJECT_BYTES} bytes "
+            "(for larger files enable 'Allow access to file URLs' for the Kimi extension)")
+    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+    code = (_JS_INJECT_FILE
+            .replace("__B64__", json.dumps(base64.b64encode(data).decode("ascii")))
+            .replace("__NAME__", json.dumps(p.name))
+            .replace("__MIME__", json.dumps(mime)))
+    res = _js(driver, code, {})
+    if not isinstance(res, dict) or not res.get("ok"):
+        raise ConsoleError("file", f"injection failed for {p.name}: {res}")
+    return {"name": p.name, "size": len(data), "mime": mime}
+
+
+def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
+                wait: float = 30.0, poll: float = 1.0) -> dict:
+    """Gate: every requested file must be injected AND shown as a chip."""
+    injected = [_inject_file(driver, f) for f in files]
+    names = [i["name"] for i in injected]
+    deadline = time.monotonic() + wait
+    chips: Any = []
+    while True:
+        payload = _js(driver, _JS_CHIPS, {})
+        chips = payload.get("attachments") if isinstance(payload, dict) else []
+        if all(n in (chips or []) for n in names):
+            break
+        if time.monotonic() >= deadline:
+            raise ConsoleError("file", f"attachment chips not verified for {names} (saw {chips})",
+                               evidence=_evidence(driver))
+        sleep(max(poll, 0.05))
+    # let the app finish processing the fresh upload before any composer work
+    sleep(2.5)
+    return {"ok": True, "injected": injected, "chips": chips}
+
+
 def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
+                files: Optional[list] = None,
                 wait_budget: float = DEFAULT_WAIT, poll_interval: float = POLL_INTERVAL,
                 submit_timeout: float = SUBMIT_TIMEOUT,
+                submit_recheck_timeout: float = 6.0,
                 config: Optional[Config] = None, driver: Any = None,
                 sleep: Callable[[float], None] = time.sleep) -> dict:
     """Ask the resident console one question, with every step verified.
@@ -552,6 +823,10 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
             raise ConsoleError("attach", "still inside a thread after new-thread navigation",
                                gates=gates, evidence=_evidence(drv))
 
+    file_names = [Path(f).expanduser().name for f in (files or [])]
+    if files:
+        gates["files"] = _gate_files(drv, files, sleep=sleep)
+
     try:
         gates["fill"] = _gate_fill(drv, query, sleep=sleep)
     except ConsoleError as fill_exc:
@@ -577,9 +852,42 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
 
     base_bubbles = int(pre.get("bubbles") or 0)
     base_studied = int(pre.get("studied") or 0)
-    gates["submit"] = _gate_submit(drv, query, base_bubbles,
-                                   timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+    base_prose_count = int(pre.get("proseCount") or 0)
+    try:
+        gates["submit"] = _gate_submit(drv, query, base_bubbles,
+                                       timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+    except ConsoleError as submit_exc:
+        if submit_exc.gate != "submit":
+            raise
+        # First, give a slow/duplicated ownership read one more chance so a
+        # late-but-correct turn never gets sent twice.
+        if _wait_ownership(drv, query, base_bubbles, timeout=submit_recheck_timeout,
+                           poll=poll_interval, sleep=sleep):
+            gates["submit"] = {"ok": True, "mechanism": "delayed-ownership",
+                               "actions": [{"action": "late-ownership", "result": "ok"}]}
+        else:
+            # Bounded recovery: a mis-sent state (e.g. file-only submission /
+            # stale editor state) is cleared by one page reload; re-inject
+            # files and retry the submit gate exactly once.
+            logger.warning("submit gate failed (%s); reloading and retrying once",
+                           submit_exc.message)
+            reload_url = _info(drv).get("url") or target
+            drv.navigate(reload_url, new_tab=False)
+            sleep(max(cfg.page_load_wait, 4.0))
+            if files:
+                gates["files_retry"] = _gate_files(drv, files, sleep=sleep)
+            try:
+                gates["submit"] = _gate_submit(drv, query, base_bubbles,
+                                               timeout=submit_timeout, poll=poll_interval,
+                                               sleep=sleep)
+                gates["submit"]["recovered"] = "reload"
+            except ConsoleError as exc2:
+                exc2.gates = {"submit_first_error": {"message": submit_exc.message,
+                                                     "evidence": submit_exc.evidence},
+                              **gates}
+                raise
     gates["complete"] = _gate_complete(drv, base_studied,
+                                       base_prose_count=base_prose_count,
                                        wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
 
     expand = _js(drv, _JS_EXPAND, "none")
@@ -595,6 +903,11 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         raise ConsoleError("extract", "latest answer text is empty",
                            gates=gates, evidence=evidence)
     gates["extract"] = {"ok": True, "chars": len(prose["text"])}
+
+    if files:
+        payload = _js(drv, _JS_CHIPS, {})
+        remaining = payload.get("attachments") if isinstance(payload, dict) else []
+        gates["send"] = {"chips_cleared": not any(n in (remaining or []) for n in file_names)}
 
     sources = _js(drv, _JS_SOURCES, [])
     if not isinstance(sources, list):
@@ -623,6 +936,8 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
         "sources": sources,
         "url": url,
         "title": post.get("title") or "",
+        "model": post.get("model") or "",
+        "attachments": file_names,
         "task": task,
         "session": state["session"],
         "new_thread": new_thread,
@@ -659,6 +974,7 @@ def console_status(*, config: Optional[Config] = None, driver: Any = None) -> di
         "bubbles": info.get("bubbles"),
         "studied": info.get("studied"),
         "prose_count": info.get("proseCount"),
+        "model": info.get("model"),
     }
     return out
 
@@ -677,6 +993,7 @@ def console_threads() -> dict:
 def console_selfcheck(*, wait_budget: float = DEFAULT_WAIT,
                       poll_interval: float = POLL_INTERVAL,
                       submit_timeout: float = SUBMIT_TIMEOUT,
+                      submit_recheck_timeout: float = 6.0,
                       config: Optional[Config] = None, driver: Any = None,
                       sleep: Callable[[float], None] = time.sleep) -> dict:
     """Run the full gate pipeline against the console with a canned query.
@@ -690,6 +1007,7 @@ def console_selfcheck(*, wait_budget: float = DEFAULT_WAIT,
         result = console_ask(SELFCHECK_QUERY, task="selfcheck", new_thread=False,
                              wait_budget=wait_budget, poll_interval=poll_interval,
                              submit_timeout=submit_timeout,
+                             submit_recheck_timeout=submit_recheck_timeout,
                              config=config, driver=driver, sleep=sleep)
     except ConsoleError as exc:
         return {"ok": False, "gate": exc.gate, "error": exc.message,

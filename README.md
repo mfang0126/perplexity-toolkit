@@ -60,14 +60,18 @@ Keep one persistent tab/group for Perplexity and route every question through ve
 perplexity console ask "Will X happen?" --task my-project -f json   # creates or continues the task thread
 perplexity console ask "And the Y angle?" --task my-project          # follow-up in the same thread
 perplexity console ask "New topic" --new-thread --task other         # fresh thread in the same tab
+perplexity console ask "Review this" --file report.pdf               # attach local files (repeatable, <=8MB)
+perplexity console models                                            # list selectable models
+perplexity console model "Claude Sonnet 5"                           # switch model (verified readback)
 perplexity console status      # state + live tab readback
 perplexity console threads     # recorded task threads
 perplexity console selfcheck   # run the full gate pipeline on a canned query
 ```
 
 - **Gates, not best effort**: every step is verified (composer equality incl. editor state, user-turn ownership, completion signals, turn-scoped answer extraction). Failures raise with a screenshot under `~/.perplexity-console/evidence/` — silent wrong answers are the one outcome the console never reports as success.
+- **Model & files**: `perplexity console models` / `model "<name>"` switch the Perplexity model with a verified readback; `ask --file` attaches local files (in-page injection, ≤8MB) and verifies every attachment chip before sending.
 - **Durable state**: `~/.perplexity-console/state.json` (session, group, per-task thread URLs). WebBridge session→tab mappings are daemon-memory only; the console attach-or-recreates the tab from the saved thread URL after daemon/browser restarts.
-- **Self-heal**: a desynced editor (DOM text vs internal state) is repaired by one bounded page reload before failing loudly.
+- **Self-heal**: a desynced editor (DOM text vs internal state) is repaired by one bounded page reload before failing loudly; mis-sent turns (e.g. file-only) recover via reload + re-inject + a bounded, duplicate-safe retry.
 
 ## Python API
 

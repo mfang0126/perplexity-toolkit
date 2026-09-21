@@ -194,6 +194,12 @@ Live-verified UI behaviors (2026-09; bake these into any direct-browser flow):
 - A late async draft-restore can merge old draft text into the composer AFTER a successful fill; the submission then carries draft+query (seen live). Re-verify composer equality immediately before submitting; repair by re-filling (fill replaces).
 - Per-turn scoping (never use `main.innerText` in a thread): user turns = `[class*="user-bubble"]` filtered `:not(.opacity-0)` (text = query + "\nHH:MM"); completion marker = one `已研究` pill per answered turn (count increments); the answer body = the LAST `main div.prose` (one per turn). The expand control in the new UI is a button labeled 「展开」 (the legacy 「查看更多」 did not appear in live mapping).
 
+Model selector & attachments (added 2026-09-21):
+
+- `perplexity console models` lists the selector menu (name/badges/checked; submenu entries like "GPT-5.6 Sol | Max" are flagged and not programmatic-selectable yet); `perplexity console model "<name>"` switches with a verified readback of the button's aria-label. The menu is a Radix portal: open and select ONLY with trusted CDP mouse clicks at element coordinates (synthetic clicks do nothing); close leftovers with Escape via CDP.
+- `ask --file PATH` (repeatable) attaches local files by building them in-page (base64 → Uint8Array → File → DataTransfer → input change event). This deliberately bypasses the WebBridge `upload` action, which requires Chrome's per-extension "Allow access to file URLs" (off by default, not toggleable by the extension; CDP `DOM.setFileInputFiles` is also blocked with "Not allowed"). Keep injection for files ≤8MB; for larger files point the user to the chrome://extensions toggle. Attachment chips verify via `aria-label="移除 <name>"`; wait ≥2s after chips appear before touching the composer.
+- Send hardening: an attachment chip keeps the submit button enabled even while the TEXT state lags — observed live as a FILE-ONLY submission. The pipeline now re-fills right before submit (freshness pass), re-verifies user-turn ownership afterwards, and recovers from a misfire with one reload + file re-inject + bounded retry (guarded by a delayed-ownership recheck so a slow-but-correct turn is never sent twice). The completion gate requires the turn-scoped prose count to GROW past the pre-submit baseline before stability counts — "the last answer hasn't changed" alone is not completion (a slow file-bearing answer once let that pass).
+
 ## Key DOM Patterns
 
 | Element | Selector Strategy | Notes |
