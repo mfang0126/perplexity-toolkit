@@ -9,6 +9,7 @@ Automate Perplexity AI search via browser control — search, extract, batch, an
 - **Result aggregation**: Dedup sources, rank by frequency, generate reports
 - **Source extraction**: Get all cited URLs with titles and snippets
 - **Follow-up capture**: Extract Perplexity's suggested follow-up questions
+- **Resident console**: one fixed tab/group workspace with verified step gates — task threads, granular steps (fill/submit/wait/extract), model switching, file attachments, and an optional Jev judge layer
 - **Agent skills**: Three ready-to-load `SKILL.md` files in [`skills/`](skills/) — routing policy, session discipline, and the verification rule — for agents that drive this toolkit
 
 ## Quick Start
@@ -280,6 +281,7 @@ readback，并在逐条 claim 经过人工或语义证据核验前标记为
 | `perplexity batch` | 批量搜索，支持恢复与限速 |
 | `perplexity aggregate` | 聚合结果、去重来源、生成报告 |
 | `perplexity history` | 管理搜索历史 |
+| `perplexity console` | 常驻控制台：固定 tab/group、任务线程、分步命令、模型切换、附件、可选 Jev 判真 |
 
 ## 常驻控制台（固定 tab / 固定 group）
 
