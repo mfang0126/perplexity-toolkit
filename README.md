@@ -52,6 +52,23 @@ one JSON document on stdout; human-readable quality text is not appended to
 readback and reports `verification_state: candidate` / `claim_support:
 not_evaluated` until a human or semantic evidence pass confirms each claim.
 
+## Resident Console (fixed tab/group)
+
+Keep one persistent tab/group for Perplexity and route every question through verified steps — one task = one thread:
+
+```bash
+perplexity console ask "Will X happen?" --task my-project -f json   # creates or continues the task thread
+perplexity console ask "And the Y angle?" --task my-project          # follow-up in the same thread
+perplexity console ask "New topic" --new-thread --task other         # fresh thread in the same tab
+perplexity console status      # state + live tab readback
+perplexity console threads     # recorded task threads
+perplexity console selfcheck   # run the full gate pipeline on a canned query
+```
+
+- **Gates, not best effort**: every step is verified (composer equality incl. editor state, user-turn ownership, completion signals, turn-scoped answer extraction). Failures raise with a screenshot under `~/.perplexity-console/evidence/` — silent wrong answers are the one outcome the console never reports as success.
+- **Durable state**: `~/.perplexity-console/state.json` (session, group, per-task thread URLs). WebBridge session→tab mappings are daemon-memory only; the console attach-or-recreates the tab from the saved thread URL after daemon/browser restarts.
+- **Self-heal**: a desynced editor (DOM text vs internal state) is repaired by one bounded page reload before failing loudly.
+
 ## Python API
 
 ```python
@@ -245,6 +262,21 @@ readback，并在逐条 claim 经过人工或语义证据核验前标记为
 | `perplexity batch` | 批量搜索，支持恢复与限速 |
 | `perplexity aggregate` | 聚合结果、去重来源、生成报告 |
 | `perplexity history` | 管理搜索历史 |
+
+## 常驻控制台（固定 tab / 固定 group）
+
+锁定一个 tab 一个 group 专门给 Perplexity，每个任务 = 一个线程：
+
+```bash
+perplexity console ask "问题" --task my-project -f json    # 创建或续接任务线程
+perplexity console ask "追问" --task my-project            # 同一线程内追问
+perplexity console ask "新话题" --new-thread --task other  # 同一 tab 内开新线程
+perplexity console status | threads | selfcheck
+```
+
+- 每步都有读回闸门（输入框等值+编辑器状态、提问轮次归属、完成信号、轮次作用域提取）；失败必带截图证据（`~/.perplexity-console/evidence/`），不会把未验证结果当作成功。
+- 状态落盘 `~/.perplexity-console/state.json`；daemon 重启后自动重建 tab 并回到保存的线程 URL（session→tab 映射仅存于 daemon 内存）。
+- 编辑器与内部状态脱钩时先做一次有界重载自愈，仍失败则大声报错。
 
 ## Python API
 
