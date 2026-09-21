@@ -2,6 +2,7 @@
 
 import json
 import csv
+import inspect
 import logging
 import os
 import time
@@ -18,6 +19,23 @@ MODE_FUNCTIONS = {
     "model_council": model_council,
     "step_by_step": step_by_step,
 }
+
+
+def _run_mode(fn, query: str, config: Config, verify: bool):
+    """Call built-in or injected mode functions across old signatures."""
+    try:
+        signature = inspect.signature(fn)
+        params = signature.parameters.values()
+        supports_verify = (
+            "verify" in signature.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        )
+    except (TypeError, ValueError):
+        supports_verify = True
+    if supports_verify:
+        return fn(query, config=config, verify=verify)
+    return fn(query, config=config)
+
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +77,7 @@ def run_batch(
     progress_file: Optional[str] = None,
     resume: bool = False,
     delay: Optional[float] = None,
+    verify: bool = True,
 ) -> List[SearchResult]:
     """Run batch search with optional resume and rate limiting.
 
@@ -118,7 +137,7 @@ def run_batch(
 
         ok = False
         try:
-            result = MODE_FUNCTIONS[mode](query, config=cfg)
+            result = _run_mode(MODE_FUNCTIONS[mode], query, cfg, verify)
             ok = True
         except Exception as e:
             failed += 1

@@ -19,8 +19,8 @@ class TestConfig:
 
     def test_make_session(self):
         cfg = Config()
-        assert cfg.make_session("test") == "perplexity-test"
-        assert cfg.make_session("search") == "perplexity-search"
+        assert cfg.make_session("test") == f"{cfg.session_prefix}-test"
+        assert cfg.make_session("search") == f"{cfg.session_prefix}-search"
 
     def test_set_config(self):
         original = get_config()

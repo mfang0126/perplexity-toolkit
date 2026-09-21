@@ -5,7 +5,11 @@ description: "Use when the user asks to use Perplexity search for a quick lookup
 
 # Perplexity Quick-Lookup Policy Alias
 
-Lightweight quick-lookup and source-grounding policy. This skill does not select models and does not retry automatically: it defines the canonical anti-hallucination prompt and the source-verification rules, then routes deeper or browser-based work to the dedicated skills.
+Lightweight quick-lookup and source-grounding policy. This skill does not select
+models or maintain browser state. It defines the canonical anti-hallucination
+prompt and source-verification rules, then routes deeper or browser-based work
+to the dedicated skills. For a normal Perplexity request with no explicit
+browser wording, the execution route is the `perplexity` CLI.
 
 ## WebBridge boundary
 
@@ -27,7 +31,18 @@ This is the lightweight quick-lookup and anti-hallucination policy layer. It is 
 - Deep, multi-turn, model-variety, or evidence-ranking research → use `perplexity-conversational-research`.
 - Any logged-in Chrome/WebBridge interaction → load `perplexity-web-automation` as the execution layer.
 
-Choose one high-level research path per task, then load the WebBridge layer only when browser execution is needed; do not run all three as duplicate top-level instructions.
+Choose one high-level research path per task, then load the WebBridge layer only when browser execution is explicitly requested; do not run all three as duplicate top-level instructions.
+
+## Route contract
+
+- Explicit `web page`/`网页方式`, `browser`, `Chrome`, `WebBridge`, `Kimi
+  WebBridge`, "open Perplexity", or "continue the current browser thread" → use
+  `perplexity-web-automation` directly and do not invoke the CLI first.
+- Any other Perplexity request → use `perplexity` CLI first. The current CLI
+  still uses WebBridge internally, but it remains the CLI-managed route.
+- If the CLI is unavailable or fails, report the failure and wait for explicit
+  authorization before using the direct browser route or the standalone
+  fallback helper.
 
 ## When to Use
 
@@ -66,11 +81,17 @@ skills must link here instead of restating it.
   - `page-content`: whether the canonical URL was actually read back, and whether it supports the claim
   Never downgrade a readable page to "no evidence" solely because HEAD returned `403`.
 - Verify sources by doing an actual **page readback on the canonical URL** (e.g. `web_extract`, or Kimi WebBridge for JS-heavy/anti-bot pages): confirm the cited claim is present in the fetched content, and only then feed that content into the project pipeline. Mark anything not confirmed this way as `not_verified`.
+- The toolkit's `verify_result` performs bounded GET readback and records `page_content` / `readback`, but deliberately returns `verification_state: candidate` and `claim_support: not_evaluated`; it does not claim semantic support automatically. Promote a claim only after the canonical content is reviewed.
 - The Perplexity answer quality score (0-100) is a **lead/discovery signal only** — never a fact-verification conclusion.
 - Red flags: prices without URLs, "studies show" without a link.
 
 ## Step 4: Failure Handling
 
-If a lookup fails, report the failure honestly — do not claim or perform automatic retries. Escalate to `perplexity-conversational-research` (deeper research) or `perplexity-web-automation` (browser execution) as appropriate.
+Report lookup failures honestly. Do not change from the CLI route to direct
+browser execution without explicit user authorization. The toolkit may perform
+bounded transport retries internally; that is different from this policy layer
+silently starting a new research route. Escalate to
+`perplexity-conversational-research` for deeper research or to
+`perplexity-web-automation` only when browser execution is in scope.
 
 

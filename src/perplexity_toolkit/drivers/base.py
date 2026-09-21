@@ -18,6 +18,15 @@ class BrowserDriver(ABC):
         """Navigate to a URL."""
         ...
 
+    def list_tabs(self) -> dict:
+        """Return the current session's tabs when the backend supports it.
+
+        Search uses this optional hook to distinguish the first navigation in
+        a session from later navigations. Backends that cannot enumerate tabs
+        may keep the default and the caller will conservatively open a tab.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def snapshot(self) -> dict:
         """Get accessibility tree snapshot."""

@@ -1,18 +1,30 @@
 ---
 name: perplexity-toolkit
-description: "Automate Perplexity AI search — batch, extract, aggregate, verify."
-version: 1.0.0
+description: "Automate Perplexity AI search — batch, extract, aggregate, verify, and run a resident console (one tab/group, task threads, verified step gates)."
+version: 1.1.0
 author: mfang0126
 license: MIT
 metadata:
   hermes:
-    tags: [search, perplexity, research, batch, automation, browser]
+    tags: [search, perplexity, research, batch, automation, browser, console]
   platforms: [macos, linux]
 ---
 
 # perplexity-toolkit
 
-Automate Perplexity AI search via browser control — search, extract, batch, and analyze.
+Automate Perplexity AI search via browser control — search, extract, batch, analyze, and run a resident console.
+
+## Route boundary
+
+The `perplexity` CLI is the default user-facing route for Perplexity requests
+that do not explicitly ask for a web page, browser, Chrome, or WebBridge. The
+CLI currently uses the toolkit's only shipped `WebBridgeDriver` underneath;
+it is not an API or headless backend. Direct browser actions are reserved for
+explicit browser/WebBridge requests — and within that route the
+`perplexity console` (resident console) is the default executor for repeat or
+one-group work; see `skills/perplexity-web-automation` and
+`skills/perplexity-conversational-research` for the agent-facing policy. CLI
+failure must not silently switch to the user's browser.
 
 ## When to Use
 
@@ -20,6 +32,7 @@ Automate Perplexity AI search via browser control — search, extract, batch, an
 - Extract all cited sources from Perplexity results
 - Aggregate and deduplicate sources across multiple searches
 - Research tasks that need Perplexity's Deep Research or Model Council modes
+- Repeat or multi-turn work in one fixed tab/group (resident console)
 
 ## Quick Start
 
@@ -64,6 +77,43 @@ perplexity history search "topic"                    # Find by title
 Valid `-m/--mode` values: `search`, `deep_research`, `model_council`,
 `step_by_step`. `history` requires an action (`list`, `search`, or `delete`).
 
+## Resident console
+
+One fixed WebBridge session (`perplexity-console`) = one tab group = one tab.
+One task = one thread; every step is verified before it counts:
+
+```bash
+perplexity console ask "query" --task research-a   # creates or continues the task thread
+perplexity console ask "follow-up" --task research-a
+perplexity console ask "new topic" --new-thread --task other
+perplexity console ask "review this" --file report.pdf   # attachments (<=8MB, verified chips)
+
+perplexity console fill "q" [--file F]             # granular steps, joined by a staged-turn ledger
+perplexity console submit | wait | extract          # each independently callable and retryable
+perplexity console send "q"                         # fill + submit only
+perplexity console attach --file F | files | detach NAME
+perplexity console open <task|url> [--new-thread]
+
+perplexity console models                           # list selectable models (badges + checked)
+perplexity console model "Claude Sonnet 5"          # switch model (verified label readback)
+perplexity console status | threads | selfcheck
+```
+
+Properties:
+
+- **Gates, not best effort** — fill equality incl. editor state, user-turn
+  ownership, completion signals, turn-scoped answer extraction; failures carry
+  a machine-readable `error_code` and an evidence screenshot
+  (`~/.perplexity-console/evidence/`).
+- **Durable state** — `~/.perplexity-console/state.json` (session, group,
+  per-task thread URL, staged turn). WebBridge session→tab mappings live only
+  in the daemon; after a restart the console attach-or-recreates the tab from
+  the saved thread URL.
+- **Optional Jev judge** — `--judge` (or `PERPLEXITY_CONSOLE_JUDGE=1`) adds an
+  advisory answer verdict and failure recovery hint; one batched TypeSafe
+  request, fail-open, validation-guarded. The pipeline never depends on it.
+- Runs are logged to `~/.perplexity-console/runs.jsonl`.
+
 ## 4 Search Modes
 
 | Mode | What It Does |
@@ -83,4 +133,5 @@ Valid `-m/--mode` values: `search`, `deep_research`, `model_council`,
 
 Every search mode drives the real browser through WebBridge; there is no API-key
 or headless path. `aggregate` is the only subcommand that runs without a browser,
-because it only post-processes result JSON you already fetched.
+because it only post-processes result JSON you already fetched. The resident
+console additionally keeps its own state under `~/.perplexity-console/`.

@@ -2,20 +2,36 @@
 name: perplexity-conversational-research
 description: "Use when the user wants deep or multi-turn Perplexity research, follow-up questions on the same thread, or several model perspectives on one topic (say \"用 perplexity 研究\" / \"perplexity 搜一下\"). The single research-policy entry point: picks between the perplexity CLI and the browser route, keeps one session and conversation URL across turns. Quick one-shot lookups go to perplexity-search; raw browser actions go to perplexity-web-automation."
 metadata:
-  version: "1.0.1"
-  requires: ["kimi-webbridge"]
+  version: "1.0.2"
+  requires: ["kimi-webbridge", "webbridge-hygiene"]
   optional: ["perplexity-toolkit"]
 ---
 
 # Perplexity Conversational Research
 
-Multi-turn Perplexity research: use the CLI/toolkit when it is installed and healthy; otherwise use WebBridge for the initial search and follow-ups. Keep one task-specific session and preserve the conversation URL.
+Multi-turn Perplexity research uses one of two explicit routes. The route is
+selected from the user's wording before any CLI or browser probe:
+
+- Explicit web/browser/Chrome/WebBridge wording → direct
+  `perplexity-web-automation` with `kimi-webbridge` and its hygiene pair.
+- Otherwise → `perplexity` CLI first. The current CLI is backed by the
+  toolkit's WebBridge driver, but it is still the CLI-managed route.
+
+If the CLI is unavailable or fails, stop and report that fact. Do not silently
+switch to the user's logged-in browser; ask for explicit authorization before
+using the direct WebBridge route or the standalone fallback helper.
 
 ## Skill stack and runtime selection
 
-This is the high-level research workflow. It should be the single research-policy entry point for a deep or multi-turn task. Use `perplexity-web-automation` for the low-level logged-in Chrome/WebBridge actions. Do not load `perplexity-search` as a second full research workflow; it is only the lightweight quick-lookup policy layer.
+This is the high-level route/workflow entry point for a deep or multi-turn task.
+Use `perplexity-web-automation` only for the explicit direct-browser route or
+for a browser follow-up that the user has authorized. Do not load
+`perplexity-search` as a second full research workflow; it is the shared
+quick-lookup and verification policy layer.
 
-Before choosing the initial route, resolve whether the optional `perplexity` CLI/toolkit is reachable from this environment (see Step 1 for the probe). If it cannot be resolved, do not treat that as a research blocker: route the initial query through WebBridge and continue with the same task session. Report it as "not resolved in this environment" rather than "not installed" — the two are different, and a bare `python3` or bare `command -v` check cannot tell them apart.
+The current CLI/toolkit is not an API or headless backend. It ultimately uses
+Kimi WebBridge and Chrome; the distinction here is the user-facing controller
+and policy route, not the underlying transport.
 
 ## When to Use
 
@@ -25,9 +41,31 @@ Before choosing the initial route, resolve whether the optional `perplexity` CLI
 
 ## Workflow
 
-### Step 1: CLI First When Available
+### Step 1: Select the route before probing
 
-Use the `perplexity` CLI for the initial search **only when the CLI and its toolkit are installed and healthy**. Never claim a CLI result that was not actually returned. If the CLI is unavailable, use `perplexity-web-automation` to search through the user's logged-in Chrome, then keep the same WebBridge session and conversation URL for follow-ups.
+Apply this gate before checking whether the CLI is installed:
+
+```text
+if the user explicitly requests a web page/网页方式/browser/Chrome/WebBridge/current browser thread:
+    use perplexity-web-automation directly
+    do not invoke perplexity CLI first
+else:
+    use perplexity CLI first
+    if CLI is unavailable or fails:
+        stop and report the failure
+        request authorization before using direct WebBridge
+```
+
+When the toolkit is installed, the same deterministic gate is available as
+`perplexity route -f json "<the original user wording>"`. It is a local
+classifier only; run it on the user's route request, not on a research topic
+that merely mentions the web.
+
+Never claim a CLI result that was not actually returned. "Not resolved in this
+environment" and "not installed" remain distinct reports, but neither permits
+an automatic browser fallback. The standalone
+`perplexity-web-automation/scripts/perplexity_search.py` helper is also an
+explicitly authorized fallback/diagnostic, not an implicit third route.
 
 ```bash
 # Availability check (do not print credentials).
@@ -47,7 +85,7 @@ done
 if [ -n "$PERPLEXITY_BIN" ] && "$PERPLEXITY_BIN" --help >/dev/null 2>&1; then
   echo "toolkit: available at $PERPLEXITY_BIN"
 else
-  echo "toolkit: not resolved — use the WebBridge route"
+  echo "toolkit: not resolved — report the CLI failure; do not switch routes"
 fi
 
 # If unresolved but you believe it is installed, ask the user for the path and
@@ -55,17 +93,25 @@ fi
 # "not installed" — report "not resolved in this environment".
 
 # If available (use "$PERPLEXITY_BIN", not a bare `perplexity`):
-perplexity search "query" -m search -f json
-perplexity search "query" -m model_council -f json
-perplexity search "query" -m step_by_step -f json
-perplexity search "query" -m deep_research -f json
+"$PERPLEXITY_BIN" --session-prefix TASK_SESSION search "query" -m search -f json
+"$PERPLEXITY_BIN" --session-prefix TASK_SESSION search "query" -m model_council -f json
+"$PERPLEXITY_BIN" --session-prefix TASK_SESSION search "query" -m step_by_step -f json
+"$PERPLEXITY_BIN" --session-prefix TASK_SESSION search "query" -m deep_research -f json
 ```
 
-The CLI, when present, handles navigation, textbox focus, query fill, submit, wait, expand, extract, sources, and quality checks. When it is absent, the WebBridge skill provides the equivalent browser path; preserve the same source-verification and session rules.
+The CLI handles navigation, textbox focus, query fill, submit, wait, expand,
+extract, sources, and quality checks. Its default session namespace is isolated
+per CLI process; pass a stable task prefix when several commands must continue
+one task. A non-zero CLI exit or a result containing `error` is a route failure,
+not permission to launch a browser fallback.
 
-### Step 2: Follow-up via WebBridge
+### Step 2: Authorized direct-browser follow-up
 
-After CLI search returns a `url`, navigate to it and submit follow-ups in the same conversation thread.
+The following WebBridge sequence is allowed only after the user explicitly
+authorizes the direct-browser route (or explicitly asks to continue the current
+browser thread). A CLI result URL alone is not authorization. If the user did
+not request browser execution and the CLI has no follow-up subcommand, report
+that limitation instead of silently issuing these browser commands.
 
 ```bash
 # 1. Navigate to the search result URL (same tab)
@@ -95,9 +141,26 @@ curl -s -X POST http://127.0.0.1:10086/command \
 sleep 15-20
 ```
 
+### Resident console (lock one group for Perplexity)
+
+The default way to satisfy "lock one group for Perplexity" is the toolkit's resident console — one WebBridge session `perplexity-console` = one group «Perplexity 控制台» = one tab; one task = one thread:
+
+```bash
+perplexity console ask "query" --task <task> [--new-thread] [-f json]
+perplexity console status | threads | selfcheck
+```
+
+**Trigger phrases → console**: when the user says 「用网页(版)的 Perplexity 搜/问…」「拿浏览器里的 Perplexity 搜…」「用（perplexity）控制台问…」, run `perplexity console ask` directly — pick one stable `--task` name from the topic (reuse the existing task name to continue an earlier thread). Do not hand-drive the raw browser steps and do not route these through `perplexity search`; the console is the executor for this route.
+
+Continuation semantics: same task → follow-up in the same thread; a new task or `--new-thread` → a fresh thread in the same tab (home → submit). State (per-task thread URLs) persists in `~/.perplexity-console/state.json`, so daemon/browser restarts do not break continuity. Every step is gated (fill equality → user-turn ownership → completion signals → turn-scoped extraction) with loud, evidence-bearing failures. When the console is unavailable, fall back to the manual recipe below.
+
 ### Fixed group + one-tab variant
 
-When the user explicitly asks for one fixed group/tab, do not use the default tab-opening path for every round. The standard CLI wrappers default to `new_tab=True`, and each mode carries its own group label; that can fragment the task into multiple tabs/groups.
+When the user explicitly asks for one fixed group/tab, do not use an explicit
+new-tab path for every round. The standard CLI wrappers preflight `list_tabs`,
+open one tab only for an empty task session, and reuse it thereafter. Each mode
+still carries its own group label; preserve the same task prefix when switching
+between commands.
 
 1. Choose one task-named WebBridge session and keep it for the whole lane. Start with `list_tabs`. If the session is empty, create exactly one tab with `newTab:true` and the user-language `group_title`; then use `newTab:false` for all reuse. Serialize every command in that session.
 2. Keep the work toolkit-first by injecting the current tab into the toolkit package instead of starting a raw browser search. The package API accepts an explicit `WebBridgeDriver` and `new_tab=False`:
@@ -126,7 +189,15 @@ If Perplexity produces contradictory versions of a page or feature, keep the con
 
 The reusable fixed-tab recipe and the observed source-conflict pattern are in `references/fixed-group-tab-and-source-conflicts.md`.
 
-### Step 3: Model Variety via Modes
+### Step 3: Named-model gate and mode variety
+
+The four toolkit modes are workflow modes, not named-model selectors. A mode
+label or `model_council` result is not evidence that K3 (or any other named
+model) answered. If the user requests a specific model, use the explicitly
+authorized direct-browser route, select the model in the UI, read the visible
+model label back, and record `selected_model` plus `model_label_verified: true`.
+If the label cannot be read back, stop with an unverified result; never infer it
+from the mode name or answer style.
 
 When user wants different model perspectives, use CLI modes instead of UI model switching:
 
@@ -163,7 +234,14 @@ A Perplexity answer score or source count is not source verification. If source 
 
 ### ⚠️ CLI result has no sources
 
-A CLI result URL, an answer string, or a high answer score is not evidence by itself. If `sources` is empty, the quality verdict is `questionable`, or the answer contains year/benchmark claims without citation markers, keep it as a lead only. Open the returned conversation URL in WebBridge, inspect the completed answer and source links, then fetch the canonical source pages before using any claims. If the canonical page does not support the claim, mark it unverified rather than preserving the Perplexity wording.
+A CLI result URL, an answer string, or a high answer score is not evidence by
+itself. If `sources` is empty, the quality verdict is `questionable`, or the
+answer contains year/benchmark claims without citation markers, keep it as a
+lead only. Do not open the returned conversation URL in the user's browser
+automatically; use an already authorized direct-browser route or ask for
+authorization first, then fetch canonical source pages before using claims.
+If the canonical page does not support the claim, mark it unverified rather
+than preserving the Perplexity wording.
 
 ### ⚠️ Dynamic page refs and long follow-ups
 

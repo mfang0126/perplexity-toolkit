@@ -2,9 +2,15 @@
 
 import logging
 import os
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+
+def _default_session_prefix() -> str:
+    """Give each CLI process an isolated default WebBridge session namespace."""
+    return f"perplexity-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 @dataclass
@@ -17,7 +23,9 @@ class Config:
     driver_backend: str = "webbridge"
     locale: str = "zh"  # 'zh' or 'en'
     webbridge_url: str = "http://127.0.0.1:10086/command"
-    session_prefix: str = "perplexity"
+    # A caller can override this with PERPLEXITY_SESSION_PREFIX when a
+    # multi-process workflow must continue the same task thread.
+    session_prefix: str = field(default_factory=_default_session_prefix)
 
     # Perplexity
     base_url: str = "https://www.perplexity.ai"
@@ -39,8 +47,8 @@ class Config:
     batch_progress_file: str = ".batch_progress"
 
     def make_session(self, suffix: str = "search") -> str:
-        """Generate a unique session name."""
-        return f"{self.session_prefix}-{suffix}"
+        """Generate a task-scoped session name for the requested mode."""
+        return self.session_prefix if not suffix else f"{self.session_prefix}-{suffix}"
 
 
 # Env var name -> Config field (all prefixed PERPLEXITY_)

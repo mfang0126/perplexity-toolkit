@@ -6,7 +6,7 @@ All modes share one pipeline (_search_core) parameterized by MODES config.
 import logging
 import random
 import time
-from typing import Optional, TypedDict, List
+from typing import Any, Dict, Optional, TypedDict, List
 
 from .config import Config, get_config
 from .drivers.base import BrowserDriver
@@ -21,6 +21,13 @@ from .utils.i18n import get_ui_string
 from .verify import verify_result
 
 logger = logging.getLogger(__name__)
+
+
+_GROUNDING_REQUIREMENTS = """Requirements:
+1. Cite sources with URLs
+2. If no verified source, say so
+3. For pricing: official page URLs only
+4. Format as comparison table with Source URL column"""
 
 
 # ──────────────────────────────────────────────
@@ -42,14 +49,63 @@ class SearchResult(TypedDict, total=False):
     query: str
     error: str
     searched_at: str
+    session: str
+    quality: Dict[str, Any]
+    verification: Dict[str, Any]
 
 
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
 
-def _make_driver(config: Config, suffix: str) -> BrowserDriver:
-    return create_driver(config, suffix)
+def _make_driver(config: Config) -> BrowserDriver:
+    """Create the task driver; all modes share its task session."""
+    return create_driver(config)
+
+
+def build_grounded_query(query: str) -> str:
+    """Apply the canonical source-grounding wrapper exactly once."""
+    if "requirements:" in query.casefold() or "要求：" in query or "要求:" in query:
+        return query
+    return f"{query.rstrip()}\n{_GROUNDING_REQUIREMENTS}"
+
+
+def _session_has_tabs(driver: Any) -> Optional[bool]:
+    """Return whether a driver session already has a tab, if supported.
+
+    WebBridge's ``success: true, tabs: []`` is a healthy empty session. Any
+    explicit error or failed status is raised so a dead bridge cannot be
+    mistaken for a reason to switch execution routes.
+    """
+    list_tabs = getattr(driver, "list_tabs", None)
+    if not callable(list_tabs):
+        return None
+    try:
+        response = list_tabs()
+    except NotImplementedError:
+        return None
+    except Exception as exc:
+        raise RuntimeError(f"list_tabs precheck failed: {exc}") from exc
+
+    if not isinstance(response, dict):
+        raise RuntimeError("list_tabs precheck returned a non-object response")
+    if response.get("error"):
+        raise RuntimeError(f"list_tabs precheck failed: {response['error']}")
+    for status_key in ("success", "ok"):
+        if status_key in response and response[status_key] is False:
+            raise RuntimeError(f"list_tabs precheck failed: {response}")
+    if "tabs" not in response:
+        raise RuntimeError("list_tabs precheck omitted the tabs field")
+    return bool(response.get("tabs"))
+
+
+def _resolve_new_tab(driver: Any, requested: Optional[bool]) -> bool:
+    """Resolve the navigation policy for a task-scoped session."""
+    has_tabs = _session_has_tabs(driver)
+    return (
+        requested if requested is not None
+        else (not has_tabs if has_tabs is not None else True)
+    )
 
 
 def _snapshot_compact(driver) -> str:
@@ -169,7 +225,7 @@ def _search_with_retry(
     query: str, mode: str, config: Config,
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
-    expand: Optional[bool] = None, new_tab: bool = True,
+    expand: Optional[bool] = None, new_tab: Optional[bool] = None,
 ) -> SearchResult:
     """Run _search_core with retry + exponential backoff."""
     max_retries = config.max_retries
@@ -245,12 +301,12 @@ def _search_core_once(
     query: str, mode: str, config: Config,
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
-    expand: Optional[bool] = None, new_tab: bool = True,
+    expand: Optional[bool] = None, new_tab: Optional[bool] = None,
 ) -> SearchResult:
     """One attempt of the Perplexity pipeline for a given mode."""
     m = MODES[mode]
     cfg = config
-    drv = driver or _make_driver(cfg, m["session"])
+    drv = driver or _make_driver(cfg)
     wait = wait_seconds or getattr(cfg, m["wait"])
     locale = cfg.locale
     if expand is None:
@@ -258,9 +314,13 @@ def _search_core_once(
 
     logger.info("Search start: mode=%s query=%r wait=%.1fs", mode, query[:80], wait)
 
+    # Preflight the session before navigation. On WebBridge, only the first
+    # navigation creates a tab; subsequent calls reuse the current tab.
+    effective_new_tab = _resolve_new_tab(drv, new_tab)
+
     # Navigate
     human_delay(0.5, 1.5)
-    drv.navigate(cfg.base_url, new_tab=new_tab,
+    drv.navigate(cfg.base_url, new_tab=effective_new_tab,
                  group_title=f"{m['group']}: {query[:50]}")
     time.sleep(cfg.page_load_wait)
 
@@ -280,7 +340,7 @@ def _search_core_once(
 
     # Type + submit
     human_delay(0.3, 0.6)
-    human_paste(drv, query, chunk_size=6, delay=0.06)
+    human_paste(drv, build_grounded_query(query), chunk_size=6, delay=0.06)
     human_delay(0.3, 0.8)
     _submit_query(drv)
 
@@ -318,6 +378,7 @@ def _search_core_once(
         "title": info.get("title", ""),
         "follow_ups": data.get("follow_ups", []),
         "mode": mode,
+        "session": getattr(drv, "session", ""),
     }
 
 
@@ -325,7 +386,7 @@ def _search_core(
     query: str, mode: str, config: Optional[Config] = None,
     driver: Optional[BrowserDriver] = None,
     wait_seconds: Optional[float] = None,
-    expand: Optional[bool] = None, new_tab: bool = True,
+    expand: Optional[bool] = None, new_tab: Optional[bool] = None,
     verify: bool = True,
 ) -> SearchResult:
     """Run the Perplexity pipeline with retry and quality verification."""
@@ -333,6 +394,12 @@ def _search_core(
     result = _search_with_retry(query, mode, cfg, driver, wait_seconds, expand, new_tab)
     if verify and not result.get("error"):
         result = verify_result(result)
+        quality = result.get("quality", {})
+        result["verification"] = {
+            "state": quality.get("verification_state", "unverified"),
+            "claim_support": quality.get("claim_support", "not_evaluated"),
+            "source_check": quality.get("source_check", {}),
+        }
     return result
 
 
@@ -342,24 +409,31 @@ def _search_core(
 
 def search(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
            wait_seconds: Optional[float] = None, expand: bool = True,
-           new_tab: bool = True) -> SearchResult:
+           new_tab: Optional[bool] = None, verify: bool = True) -> SearchResult:
     """Standard Perplexity search with anti-detection."""
-    return _search_core(query, "search", config, driver, wait_seconds, expand, new_tab)
+    return _search_core(query, "search", config, driver, wait_seconds, expand,
+                        new_tab, verify)
 
 
 def deep_research(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
-                  wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
+                  wait_seconds: Optional[float] = None, new_tab: Optional[bool] = None,
+                  verify: bool = True) -> SearchResult:
     """Deep Research mode — multi-step, longer answers, 60-120s."""
-    return _search_core(query, "deep_research", config, driver, wait_seconds, None, new_tab)
+    return _search_core(query, "deep_research", config, driver, wait_seconds,
+                        None, new_tab, verify)
 
 
 def model_council(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
-                  wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
+                  wait_seconds: Optional[float] = None, new_tab: Optional[bool] = None,
+                  verify: bool = True) -> SearchResult:
     """Model Council mode — multiple models answer the same question."""
-    return _search_core(query, "model_council", config, driver, wait_seconds, None, new_tab)
+    return _search_core(query, "model_council", config, driver, wait_seconds,
+                        None, new_tab, verify)
 
 
 def step_by_step(query: str, config: Optional[Config] = None, driver: Optional[BrowserDriver] = None,
-                 wait_seconds: Optional[float] = None, new_tab: bool = True) -> SearchResult:
+                 wait_seconds: Optional[float] = None, new_tab: Optional[bool] = None,
+                 verify: bool = True) -> SearchResult:
     """Step-by-step Learning mode — guided, structured answers."""
-    return _search_core(query, "step_by_step", config, driver, wait_seconds, None, new_tab)
+    return _search_core(query, "step_by_step", config, driver, wait_seconds,
+                        None, new_tab, verify)
