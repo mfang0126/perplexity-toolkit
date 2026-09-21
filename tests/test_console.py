@@ -313,9 +313,10 @@ def tmp_console_home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _ask(drv, query, *, task="default", new_thread=False, files=None,
+def _ask(drv, query, *, task="default", new_thread=False, files=None, judge=None,
          wait_budget=1.0, poll_interval=0.01, submit_timeout=0.4, sleep=NOOP):
     return console_ask(query, task=task, new_thread=new_thread, files=files,
+                       judge=judge,
                        wait_budget=wait_budget, poll_interval=poll_interval,
                        submit_timeout=submit_timeout, submit_recheck_timeout=0.1,
                        config=make_config(), driver=drv, sleep=sleep)
@@ -751,3 +752,58 @@ class TestGranularFlow:
                          poll_interval=0.01)
         assert r["ok"] and r["gates"]["submit"]["ok"]
         assert load_state()["pending"]["status"] == "submitted"
+
+
+class TestJudgeIntegration:
+    def test_ask_judge_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("PERPLEXITY_CONSOLE_JUDGE", raising=False)
+        drv = ConsoleFakeDriver()
+        res = _ask(drv, "q-judge-off")
+        assert res["judge"] == {"enabled": False}
+
+    def test_ask_judge_verdict_recorded(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+        seen = {}
+
+        def fake_judge(query, answer, *, client=None, flag=None):
+            seen["query"], seen["answer"], seen["flag"] = query, answer, flag
+            return {"enabled": True, "status": "ok",
+                    "answers_question": 0.99, "complete": 0.98}
+
+        monkeypatch.setattr(console_judge, "judge_extraction", fake_judge)
+        drv = ConsoleFakeDriver()
+        res = _ask(drv, "q-judge-on", judge=True)
+        assert res["judge"]["status"] == "ok"
+        assert seen["answer"] == "答案 42。"
+        assert seen["flag"] is True
+
+    def test_extract_judge_uses_pending_query(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 1,
+        }
+        state["pending"] = {
+            "task": "default", "query": "文件里的数字", "new_thread": False,
+            "files": [], "file_paths": [],
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "base_bubbles": 1, "base_studied": 1, "base_prose_count": 1,
+            "filled_at": _now_iso(), "submitted_at": _now_iso(),
+            "status": "completed",
+        }
+        save_state(state)
+        seen = {}
+
+        def fake_judge(query, answer, *, client=None, flag=None):
+            seen["query"] = query
+            return {"enabled": True, "status": "ok"}
+
+        monkeypatch.setattr(console_judge, "judge_extraction", fake_judge)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        drv.prose = ["答案 42。"]
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP, judge=True)
+        assert seen["query"] == "文件里的数字"
+        assert res["judge"]["status"] == "ok"

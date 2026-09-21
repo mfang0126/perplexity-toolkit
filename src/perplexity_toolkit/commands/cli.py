@@ -33,8 +33,19 @@ def _console_error_payload(exc) -> dict:
 
 
 def _console_fail(exc, fmt: str) -> None:
+    hint = None
+    try:
+        from ..console_judge import route_hint
+        candidate = route_hint(exc.gate, getattr(exc, "code", None), exc.message)
+        if candidate.get("status") == "ok":
+            hint = candidate
+    except Exception:  # noqa: BLE001 — the optional judge must never break failure reporting
+        hint = None
+    payload = _console_error_payload(exc)
+    if hint:
+        payload["jev_hint"] = hint
     if fmt == "json":
-        print(json.dumps(_console_error_payload(exc), ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"FAILED at gate: {exc.gate}")
         print(f"  {exc.message}")
@@ -42,6 +53,8 @@ def _console_fail(exc, fmt: str) -> None:
             print(f"  code: {exc.code}")
         if exc.evidence:
             print(f"  evidence: {exc.evidence}")
+        if hint:
+            print(f"  hint (Jev): {hint['route']}  (confidence {hint['confidence']:.2f})")
 
 
 def _console_run_step(fn, fmt: str, *, args=(), kwargs=None,
@@ -100,7 +113,8 @@ def cmd_console(args) -> int:
             result = console_ask(args.query, task=args.task,
                                  new_thread=args.new_thread,
                                  wait_budget=args.wait_budget,
-                                 files=getattr(args, "file", None))
+                                 files=getattr(args, "file", None),
+                                 judge=getattr(args, "judge", None))
         except ConsoleError as exc:
             _console_fail(exc, fmt)
             return 1
@@ -114,6 +128,13 @@ def cmd_console(args) -> int:
             print(f"url: {result['url']}")
             print(f"model: {result.get('model') or '-'}  "
                   f"attachments: {', '.join(result.get('attachments') or []) or '-'}")
+            j = result.get("judge") or {}
+            if j.get("enabled"):
+                if j.get("status") in {"ok", "review", "concern"}:
+                    print(f"judge: {j['status']} (answers_question="
+                          f"{j.get('answers_question'):.2f}, complete={j.get('complete'):.2f})")
+                else:
+                    print(f"judge: {j.get('status')} ({j.get('reason', '')})")
             print(f"sources: {len(result['sources'])}")
             gate_bits = []
             for name, value in result["gates"].items():
@@ -215,8 +236,17 @@ def cmd_console(args) -> int:
                          f"sources: {len(p.get('sources') or [])}")
             if (p.get("gates") or {}).get("send"):
                 lines.append(f"send: chips_cleared={p['gates']['send'].get('chips_cleared')}")
+            j = p.get("judge") or {}
+            if j.get("enabled"):
+                if j.get("status") in {"ok", "review", "concern"}:
+                    lines.append(f"judge: {j['status']} (answers_question="
+                                 f"{j.get('answers_question'):.2f}, complete={j.get('complete'):.2f})")
+                else:
+                    lines.append(f"judge: {j.get('status')} ({j.get('reason', '')})")
             return lines
-        ok = _console_run_step(console_extract, fmt, text_lines=_t_extract)
+        ok = _console_run_step(console_extract, fmt,
+                               kwargs={"judge": getattr(args, "judge", None)},
+                               text_lines=_t_extract)
         return 0 if ok else 1
 
     if action == "send":
@@ -453,6 +483,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Completion budget in seconds")
     pc.add_argument("--file", action="append", metavar="PATH",
                     help="Attach a local file to the message (repeatable; <=8MB)")
+    pc.add_argument("--judge", dest="judge", action="store_true", default=None,
+                    help="Ask Jev to judge the extracted answer (advisory; env PERPLEXITY_CONSOLE_JUDGE=1)")
+    pc.add_argument("--no-judge", dest="judge", action="store_false",
+                    help="Disable the Jev judge for this call")
     pc = csub.add_parser("status", help="Show console state and live tab readback")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc = csub.add_parser("threads", help="List known task threads")
@@ -484,6 +518,10 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0)
     pc = csub.add_parser("extract", help="Extract the newest answer; consumes the staged turn")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
+    pc.add_argument("--judge", dest="judge", action="store_true", default=None,
+                    help="Ask Jev to judge the extracted answer (advisory)")
+    pc.add_argument("--no-judge", dest="judge", action="store_false",
+                    help="Disable the Jev judge for this call")
     pc = csub.add_parser("send", help="Stage + submit in one call (fill + submit)")
     pc.add_argument("query")
     pc.add_argument("--task", default="default")

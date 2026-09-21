@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import console_judge
 from .config import Config, get_config
 
 logger = logging.getLogger(__name__)
@@ -1101,6 +1102,7 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
                 wait_budget: float = DEFAULT_WAIT, poll_interval: float = POLL_INTERVAL,
                 submit_timeout: float = SUBMIT_TIMEOUT,
                 submit_recheck_timeout: float = 6.0,
+                judge: Optional[bool] = None,
                 config: Optional[Config] = None, driver: Any = None,
                 sleep: Callable[[float], None] = time.sleep) -> dict:
     """Ask the resident console one question, with every step verified.
@@ -1130,12 +1132,14 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
                                        wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
 
     out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
+    judgment = console_judge.judge_extraction(query, out["answer"], flag=judge)
     _log_run("ask", ok=True, url=out["url"],
              elapsed=time.monotonic() - started)
 
     return {
         "ok": True,
         "answer": out["answer"],
+        "judge": judgment,
         "raw_answer": out["raw_answer"],
         "sources": out["sources"],
         "url": out["url"],
@@ -1244,6 +1248,7 @@ def console_wait(*, config: Optional[Config] = None, driver: Any = None,
 
 
 def console_extract(*, config: Optional[Config] = None, driver: Any = None,
+                    judge: Optional[bool] = None,
                     sleep: Callable[[float], None] = time.sleep) -> dict:
     """Extract the newest answer (+sources); consumes the staged turn."""
     cfg = config or get_config()
@@ -1254,6 +1259,8 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
     out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
     out["gates"] = gates
     out["task"] = (pending or {}).get("task") or state.get("active_task")
+    out["judge"] = console_judge.judge_extraction(
+        (pending or {}).get("query") or "", out.get("answer") or "", flag=judge)
     _log_run("extract", ok=True, url=out.get("url"))
     return out
 
