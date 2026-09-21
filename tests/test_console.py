@@ -63,7 +63,8 @@ class ConsoleFakeDriver(BrowserDriver):
                  submit_disabled=False, fill_noop_first=0,
                  fill_appends=False, race_draft_after=None,
                  race_draft_text="旧草稿", force_btn_disabled=False,
-                 btn_missing_first_click=0, desync_until_reload=False):
+                 btn_missing_first_click=0, desync_until_reload=False,
+                 desync_recover_after=1):
         self.url = url
         self.answer = answer
         self.share_tab = share_tab
@@ -78,6 +79,8 @@ class ConsoleFakeDriver(BrowserDriver):
         self.force_btn_disabled = force_btn_disabled
         self.btn_missing_first_click = btn_missing_first_click
         self.editor_desynced = desync_until_reload
+        self._desync_recover_after = desync_recover_after
+        self._nav_count = 0
         self.composer = ""
         self.bubbles = []
         self.studied = 0
@@ -133,7 +136,9 @@ class ConsoleFakeDriver(BrowserDriver):
         self.share_tab = True
         self.url = url.rstrip("/") or BASE_URL
         self.tab_url = self.url
-        self.editor_desynced = False  # a reload resets the editor
+        self._nav_count += 1
+        if self._nav_count >= self._desync_recover_after:
+            self.editor_desynced = False  # a reload resets the editor
         self.misfire_until_reload = False  # a reload resets the misfire mode
         if url.rstrip("/") == BASE_URL.rstrip("/"):
             self.bubbles = []
@@ -807,3 +812,73 @@ class TestJudgeIntegration:
         res = console_extract(config=make_config(), driver=drv, sleep=NOOP, judge=True)
         assert seen["query"] == "文件里的数字"
         assert res["judge"]["status"] == "ok"
+
+
+class TestJevDirectedRecovery:
+    """Jev decides among safe remedies; the code executes at most one attempt.
+
+    Concept from browser-use/jev-ultrafast: Jev is the decision layer, code
+    owns execution and safety bounds. Only fill/wait/extract are in scope —
+    send paths stay advisory-only so an automatic retry can never send twice.
+    """
+
+    def test_fill_jev_recovery_after_builtin_reload_fails(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "turns": 1,
+        }
+        save_state(state)
+        monkeypatch.setattr(
+            console_judge, "route_hint",
+            lambda gate, code, message, *, client=None, flag=None: {
+                "enabled": True, "status": "ok", "route": "reload-and-retry",
+                "confidence": 0.72})
+        # editor desync that survives the BUILT-IN single-reload recovery:
+        # only a SECOND navigation heals it — the Jev-directed one.
+        drv = ConsoleFakeDriver(
+            share_tab=True, url="https://www.perplexity.ai/search/fake-thread-1",
+            desync_until_reload=True, desync_recover_after=2)
+        res = console_fill("q-jev", config=make_config(), driver=drv, sleep=NOOP,
+                           judge=True)
+        assert res["ok"]
+        jr = res["gates"]["jev_recovery"]
+        assert jr["route"] == "reload-and-retry"
+        assert jr["applied"] is True and jr["attempts"] == 1
+        navs = [c for c in drv.calls if c[0] == "navigate" and c[2] is False]
+        assert len(navs) >= 2  # built-in reload + Jev-directed reload
+
+    def test_fill_jev_recovery_escalate_raises_original(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+
+        monkeypatch.setattr(
+            console_judge, "route_hint",
+            lambda gate, code, message, *, client=None, flag=None: {
+                "enabled": True, "status": "ok", "route": "escalate",
+                "confidence": 0.9})
+        drv = ConsoleFakeDriver(force_btn_disabled=True)
+        with pytest.raises(ConsoleError) as excinfo:
+            console_fill("q-jev-escalate", config=make_config(), driver=drv,
+                         sleep=NOOP, judge=True)
+        assert excinfo.value.gate == "fill"
+        # escalate -> nothing executed, no recovery metadata attached
+        assert "jev_recovery" not in (excinfo.value.gates or {})
+
+    def test_send_paths_never_ask_jev_for_recovery(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+
+        calls = []
+
+        def spy(gate, code, message, *, client=None, flag=None):
+            calls.append(gate)
+            return {"enabled": True, "status": "ok", "route": "retry-step",
+                    "confidence": 0.5}
+
+        monkeypatch.setattr(console_judge, "route_hint", spy)
+        drv = ConsoleFakeDriver(force_btn_disabled=True)
+        with pytest.raises(ConsoleError):
+            console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        assert calls == []  # send paths stay advisory-only

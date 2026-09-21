@@ -3,7 +3,7 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 
@@ -207,6 +207,8 @@ Optional Jev judge (added 2026-09-21; off by default):
 - Enable per call (`--judge`) or globally (`PERPLEXITY_CONSOLE_JUDGE=1`); one extra TypeSafe request per judged step, ~$0.00001.
 - `ask`/`extract --judge` record an advisory verdict on the extracted answer (`judge: ok|review|concern` from two Nouls: answers-the-question + completeness). A `concern` verdict should make the operator re-check before trusting the answer.
 - Failed steps print `hint (Jev): <route> (confidence …)` — one Choice over {retry-step, reload-and-retry, wait-longer, escalate}; `pending.*` codes skip judging (deterministic guidance already in the message).
+- **Bounded Jev-directed recovery (fill/wait/extract)**: the route is not just advice — `reload-and-retry` actually reloads the tab, `wait-longer` actually extends the wait, then the step re-runs ONCE under all original gates; the result carries `gates.jev_recovery` (`{route, confidence, applied, attempts}`) and a failed re-run raises with `jev_recovery` in its gates. `escalate` or any non-ok decision re-raises the original error unchanged.
+- **Send paths stay advisory-only** (`submit`/`send`/`ask`): Jev never gets execution rights there, so an automatic retry can never double-send.
 - Fail-open: no key / network / contract problem → `status: unavailable`, the pipeline is never blocked or changed. Responses are validated before use (probability set/arg-max/sum — adapted from browser-use/jev-ultrafast, MIT); invalid responses are discarded.
 
 Conventions: WebBridge session `perplexity-console`, group «Perplexity 控制台», exactly one tab. Durable state lives in `~/.perplexity-console/state.json` (session, group, per-task thread URL) because session→tab mappings are daemon-memory only and die on daemon restart — the console attach-or-recreates by reopening the saved thread URL. Every step carries a readback gate; failures raise with a screenshot under `~/.perplexity-console/evidence/`.

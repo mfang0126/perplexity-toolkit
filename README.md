@@ -84,7 +84,7 @@ perplexity console open <task|url> [--new-thread]
 - **Gates, not best effort**: every step is verified (composer equality incl. editor state, user-turn ownership, completion signals, turn-scoped answer extraction). Failures raise with a screenshot under `~/.perplexity-console/evidence/` and a machine-readable `error_code` — silent wrong answers are the one outcome the console never reports as success.
 - **Stepwise, not one-shot**: `ask` is a composite of granular steps (`fill → submit → wait → extract`) that share one implementation each; the steps are also callable alone and compose through a staged-turn ledger (`state.json → pending`), so retries and unusual flows are per-step instead of all-or-nothing. Every run appends one line to `~/.perplexity-console/runs.jsonl`.
 - **Model & files**: `perplexity console models` / `model "<name>"` switch the Perplexity model with a verified readback; `ask --file` attaches local files (in-page injection, ≤8MB) and verifies every attachment chip before sending.
-- **Optional Jev judge**: `ask --judge` / `extract --judge` (or `PERPLEXITY_CONSOLE_JUDGE=1`) adds an advisory verdict on extracted answers and a recovery hint on failed steps, via one batched TypeSafe request — fail-open and validation-guarded; the pipeline never depends on it.
+- **Optional Jev judge**: `ask --judge` / `extract --judge` (or `PERPLEXITY_CONSOLE_JUDGE=1`) adds an advisory verdict on extracted answers and recovery routing; on failing **fill/wait/extract** steps the chosen remedy is executed once (bounded Jev-directed recovery, re-run under all original gates) while send paths stay advisory-only — via one batched TypeSafe request, fail-open and validation-guarded; the pipeline never depends on it.
 - **Durable state**: `~/.perplexity-console/state.json` (session, group, per-task thread URLs). WebBridge session→tab mappings are daemon-memory only; the console attach-or-recreates the tab from the saved thread URL after daemon/browser restarts.
 - **Self-heal**: a desynced editor (DOM text vs internal state) is repaired by one bounded page reload before failing loudly; mis-sent turns (e.g. file-only) recover via reload + re-inject + a bounded, duplicate-safe retry.
 
@@ -307,7 +307,7 @@ perplexity console status | threads | selfcheck
 - 编辑器与内部状态脱钩时先做一次有界重载自愈，仍失败则大声报错。
 - 分步命令 `fill / submit / wait / extract / send / attach / files / detach / open` 由 staged-turn 账本衔接——可单独重试、可自由组合（意图驱动）。
 - `perplexity console models` / `model "<名称>"` 切换模型（回读验证）；`ask --file` 附加文件（≤8MB，chip 验证）。
-- 可选 Jev 判真（`--judge` 或 `PERPLEXITY_CONSOLE_JUDGE=1`）：提取判真 + 失败路由建议；fail-open，管道永不依赖它。
+- 可选 Jev 判真（`--judge` 或 `PERPLEXITY_CONSOLE_JUDGE=1`）：提取判真 + 失败路由；fill/wait/extract 失败时按 Jev 处置执行**一次**有界恢复（重跑全部原闸门），发送路径保持只建议；fail-open，管道永不依赖它。
 
 ## Python API
 

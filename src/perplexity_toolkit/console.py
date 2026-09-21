@@ -1188,18 +1188,81 @@ def console_open(target: str, *, new_thread: bool = False,
             "new_thread": new_thread, "attach": ctx["attach"]}
 
 
+def _reload_console_tab(cfg: Config, state: dict, *,
+                        sleep: Callable[[float], None],
+                        driver: Any = None) -> None:
+    """Reload the console's current tab (used by Jev-directed recovery)."""
+    drv = driver or _make_driver(cfg, state)
+    current = _info(drv).get("url") or BASE_URL
+    drv.navigate(current, new_tab=False)
+    sleep(max(cfg.page_load_wait, 4.0))
+
+
+def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
+                           judge: Optional[bool], cfg: Config, state: dict,
+                           sleep: Callable[[float], None],
+                           driver: Any = None) -> dict:
+    """Run a step; on failure with judging on, let Jev pick ONE bounded remedy.
+
+    Concept from browser-use/jev-ultrafast: Jev chooses among offered
+    operations, code owns execution and safety. Scope limits here:
+
+    - only safe, non-send steps (fill / wait / extract) — send paths stay
+      advisory-only so an automatic retry can never double-send;
+    - the remedy set is fixed {retry-step, reload-and-retry, wait-longer,
+      escalate} and exactly ONE extra attempt is executed;
+    - the retried run passes every original gate again; any non-ok decision
+      (escalate / unavailable / skipped) re-raises the original error.
+    """
+    try:
+        return run()
+    except ConsoleError as exc:
+        if step not in ("fill", "wait", "extract"):
+            raise
+        decision = console_judge.route_hint(exc.gate, exc.code, exc.message, flag=judge)
+        route = decision.get("route") if decision.get("status") == "ok" else None
+        if route not in ("retry-step", "reload-and-retry", "wait-longer"):
+            raise  # escalate / unavailable / skipped -> original error stands
+        logger.warning("jev-directed recovery: %s (confidence %.2f) after %s",
+                       route, decision.get("confidence") or 0.0, exc.code or exc.gate)
+        if route == "reload-and-retry":
+            _reload_console_tab(cfg, state, sleep=sleep, driver=driver)
+        elif route == "wait-longer":
+            sleep(6.0)
+        try:
+            result = run()
+        except ConsoleError as exc2:
+            exc2.gates = {"jev_recovery": {"route": route, "applied": True,
+                                           "attempts": 1, "first_error": exc.message},
+                          **exc2.gates}
+            raise
+        if isinstance(result, dict):
+            gates = result.setdefault("gates", {})
+            if isinstance(gates, dict):
+                gates["jev_recovery"] = {"route": route,
+                                         "confidence": decision.get("confidence"),
+                                         "applied": True, "attempts": 1}
+        return result
+
+
 def console_fill(query: str, *, task: str = "default", new_thread: bool = False,
                  files: Optional[list] = None,
+                 judge: Optional[bool] = None,
                  config: Optional[Config] = None, driver: Any = None,
                  sleep: Callable[[float], None] = time.sleep) -> dict:
     """Stage a turn: attach files, fill the composer, verify — no send."""
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
-    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
-                         files=files, sleep=sleep)
-    _log_run("fill", ok=True, url=staged["pending"].get("url"))
-    return {"ok": True, "gates": staged["gates"], "pending": staged["pending"]}
+
+    def _once() -> dict:
+        staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
+                             files=files, sleep=sleep)
+        _log_run("fill", ok=True, url=staged["pending"].get("url"))
+        return {"ok": True, "gates": staged["gates"], "pending": staged["pending"]}
+
+    return _run_with_jev_recovery("fill", _once, judge=judge, cfg=cfg, state=state,
+                                  sleep=sleep, driver=drv)
 
 
 def console_submit(*, config: Optional[Config] = None, driver: Any = None,
@@ -1228,6 +1291,7 @@ def console_submit(*, config: Optional[Config] = None, driver: Any = None,
 
 
 def console_wait(*, config: Optional[Config] = None, driver: Any = None,
+                 judge: Optional[bool] = None,
                  sleep: Callable[[float], None] = time.sleep,
                  wait_budget: float = DEFAULT_WAIT,
                  poll_interval: float = POLL_INTERVAL) -> dict:
@@ -1235,16 +1299,21 @@ def console_wait(*, config: Optional[Config] = None, driver: Any = None,
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
-    pending = _pending_require(state, stage="wait")
-    gate = _gate_complete(drv, int(pending.get("base_studied") or 0),
-                          base_prose_count=int(pending.get("base_prose_count") or 0),
-                          wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
-    pending["completed_at"] = _now_iso()
-    pending["status"] = "completed"
-    state["pending"] = pending
-    save_state(state)
-    _log_run("wait", ok=True, url=pending.get("url"))
-    return {"ok": True, "gates": {"complete": gate}}
+
+    def _once() -> dict:
+        pending = _pending_require(state, stage="wait")
+        gate = _gate_complete(drv, int(pending.get("base_studied") or 0),
+                              base_prose_count=int(pending.get("base_prose_count") or 0),
+                              wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
+        pending["completed_at"] = _now_iso()
+        pending["status"] = "completed"
+        state["pending"] = pending
+        save_state(state)
+        _log_run("wait", ok=True, url=pending.get("url"))
+        return {"ok": True, "gates": {"complete": gate}}
+
+    return _run_with_jev_recovery("wait", _once, judge=judge, cfg=cfg, state=state,
+                                  sleep=sleep, driver=drv)
 
 
 def console_extract(*, config: Optional[Config] = None, driver: Any = None,
@@ -1254,15 +1323,20 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
-    pending = _pending(state) or None
-    gates: dict = {}
-    out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
-    out["gates"] = gates
-    out["task"] = (pending or {}).get("task") or state.get("active_task")
-    out["judge"] = console_judge.judge_extraction(
-        (pending or {}).get("query") or "", out.get("answer") or "", flag=judge)
-    _log_run("extract", ok=True, url=out.get("url"))
-    return out
+
+    def _once() -> dict:
+        pending = _pending(state) or None
+        gates: dict = {}
+        out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
+        out["gates"] = gates
+        out["task"] = (pending or {}).get("task") or state.get("active_task")
+        out["judge"] = console_judge.judge_extraction(
+            (pending or {}).get("query") or "", out.get("answer") or "", flag=judge)
+        _log_run("extract", ok=True, url=out.get("url"))
+        return out
+
+    return _run_with_jev_recovery("extract", _once, judge=judge, cfg=cfg, state=state,
+                                  sleep=sleep, driver=drv)
 
 
 def console_send(query: str, *, task: str = "default", new_thread: bool = False,

@@ -110,8 +110,11 @@ Properties:
   in the daemon; after a restart the console attach-or-recreates the tab from
   the saved thread URL.
 - **Optional Jev judge** — `--judge` (or `PERPLEXITY_CONSOLE_JUDGE=1`) adds an
-  advisory answer verdict and failure recovery hint; one batched TypeSafe
-  request, fail-open, validation-guarded. The pipeline never depends on it.
+  advisory answer verdict and failure recovery hints; on failing fill/wait/
+  extract steps the chosen remedy is **executed once** (bounded Jev-directed
+  recovery: reload / wait-longer / retry, re-run under all original gates)
+  while send paths stay advisory-only. One batched TypeSafe request, fail-open,
+  validation-guarded. The pipeline never depends on it.
 - Runs are logged to `~/.perplexity-console/runs.jsonl`.
 
 ## 4 Search Modes

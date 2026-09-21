@@ -201,12 +201,18 @@ def cmd_console(args) -> int:
         def _t_fill(p):
             pend = p["pending"]
             files = ", ".join(pend.get("files") or []) or "-"
-            return [f"staged: task={pend['task']} query={pend['query'][:60]!r} files={files}",
-                    f"gates: {', '.join(k + '=ok' for k in p['gates'])}"]
+            lines = [f"staged: task={pend['task']} query={pend['query'][:60]!r} files={files}",
+                     f"gates: {', '.join(k + '=ok' for k in p['gates'])}"]
+            jr = (p.get("gates") or {}).get("jev_recovery")
+            if jr:
+                lines.append(f"jev recovery: {jr.get('route')} "
+                             f"(applied, attempts={jr.get('attempts', 1)})")
+            return lines
         ok = _console_run_step(
             console_fill, fmt, args=(args.query,),
             kwargs={"task": args.task, "new_thread": args.new_thread,
-                    "files": getattr(args, "file", None)},
+                    "files": getattr(args, "file", None),
+                    "judge": getattr(args, "judge", None)},
             text_lines=_t_fill)
         return 0 if ok else 1
 
@@ -223,9 +229,15 @@ def cmd_console(args) -> int:
     if action == "wait":
         def _t_wait(p):
             g = p["gates"]["complete"]
-            return [f"completed: chars={g.get('chars')} method={g.get('method')}"]
+            lines = [f"completed: chars={g.get('chars')} method={g.get('method')}"]
+            jr = (p.get("gates") or {}).get("jev_recovery")
+            if jr:
+                lines.append(f"jev recovery: {jr.get('route')} "
+                             f"(applied, attempts={jr.get('attempts', 1)})")
+            return lines
         ok = _console_run_step(console_wait, fmt,
-                               kwargs={"wait_budget": args.wait_budget},
+                               kwargs={"wait_budget": args.wait_budget,
+                                       "judge": getattr(args, "judge", None)},
                                text_lines=_t_wait)
         return 0 if ok else 1
 
@@ -236,6 +248,10 @@ def cmd_console(args) -> int:
                          f"sources: {len(p.get('sources') or [])}")
             if (p.get("gates") or {}).get("send"):
                 lines.append(f"send: chips_cleared={p['gates']['send'].get('chips_cleared')}")
+            jr = (p.get("gates") or {}).get("jev_recovery")
+            if jr:
+                lines.append(f"jev recovery: {jr.get('route')} "
+                             f"(applied, attempts={jr.get('attempts', 1)})")
             j = p.get("judge") or {}
             if j.get("enabled"):
                 if j.get("status") in {"ok", "review", "concern"}:
@@ -509,6 +525,10 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--task", default="default")
     pc.add_argument("--new-thread", action="store_true")
     pc.add_argument("--file", action="append", metavar="PATH")
+    pc.add_argument("--judge", dest="judge", action="store_true", default=None,
+                    help="Allow one bounded Jev-directed recovery on failure (advisory decision, code executes)")
+    pc.add_argument("--no-judge", dest="judge", action="store_false",
+                    help="Disable the Jev judge for this call")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc = csub.add_parser("submit", help="Submit the staged turn (verified)")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
@@ -516,6 +536,10 @@ def build_parser() -> argparse.ArgumentParser:
     pc = csub.add_parser("wait", help="Wait for the staged turn's answer to settle")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0)
+    pc.add_argument("--judge", dest="judge", action="store_true", default=None,
+                    help="Allow one bounded Jev-directed recovery on failure (advisory decision, code executes)")
+    pc.add_argument("--no-judge", dest="judge", action="store_false",
+                    help="Disable the Jev judge for this call")
     pc = csub.add_parser("extract", help="Extract the newest answer; consumes the staged turn")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc.add_argument("--judge", dest="judge", action="store_true", default=None,
