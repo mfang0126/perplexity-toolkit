@@ -64,6 +64,29 @@ SUBMIT_TIMEOUT = 15.0         # seconds to observe the new user turn
 FILL_SETTLE = 0.7             # seconds after a fill/CDP insert before readback
 SELFCHECK_QUERY = "用一句话回答：1+1 等于几？"
 
+
+def _answer_settled(info: dict, prev_len: int, stable: int) -> tuple[bool, str]:
+    """Completion decision for `_gate_complete` — deterministic signals only.
+
+    Semantics (live-verified): `submit_button`'s `disabled` means "editor internal
+    state is empty" — the STEADY STATE after submit (Perplexity clears the
+    composer). So any non-missing submit control counts as "returned";
+    `enabled`/`disabled` are both DONE. `generating` (whole-page text regex) and
+    the `studied` pill are ADVISORY ONLY (never in the conjunction).
+
+    Returns (settled, signal); signal ∈ {"", "button+stable", "length-only"}.
+    """
+    submit = info.get("submit_button") or "missing"
+    stop_visible = bool(info.get("stop_button"))
+    length = int(info.get("lastProseLen") or 0)
+    if length <= 0 or length != prev_len or stable < 2:
+        return False, ""
+    if stop_visible:
+        return False, ""
+    if submit in ("enabled", "disabled"):
+        return True, "button+stable"
+    return True, "length-only"
+
 # ──────────────────────────────────────────────────────────────
 # JS snippets (markers are relied on by tests: 'user-bubble', 'cloneNode',
 # "a[href]", '提交', 'dispatchEvent', "=== '展开'").
@@ -84,7 +107,16 @@ _JS_INFO = r"""(() => {
     title: document.title,
     composer: ce ? String(ce.innerText || '') : '',
     model: modelBtn ? (modelBtn.getAttribute('aria-label') || '') : '',
-    submit_button: (() => { const b = document.querySelector('button[aria-label="提交"]'); return b ? (b.disabled ? 'disabled' : 'enabled') : 'missing'; })(),
+    submit_button: (() => {
+      const root = main || document;
+      const b = root.querySelector(
+        'button[aria-label="提交"],button[aria-label="搜索"],button[aria-label="Submit"]'
+      );
+      return b ? (b.disabled ? "disabled" : "enabled") : "missing";
+    })(),
+    stop_button: [...document.querySelectorAll(
+      'button[aria-label*="停止"],button[aria-label*="Stop" i]'
+    )].some(b => (b.checkVisibility?.() ?? b.offsetParent !== null)),
     bubbles: bubbles.length,
     lastBubble: bubbles.length ? String(bubbles[bubbles.length - 1].innerText || '').slice(0, 300) : '',
     studied: btns.filter(b => String(b.innerText || '').includes('已研究')).length,

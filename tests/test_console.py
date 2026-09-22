@@ -20,6 +20,7 @@ import sys; sys.path.insert(0, "src")
 
 import pytest
 
+from perplexity_toolkit import console
 from perplexity_toolkit.config import Config
 from perplexity_toolkit.console import (
     BASE_URL,
@@ -218,6 +219,7 @@ class ConsoleFakeDriver(BrowserDriver):
                 "title": "Perplexity",
                 "composer": self.composer,
                 "submit_button": self._btn_state(),
+                "stop_button": False,
                 "model": self.model,
                 "bubbles": len(self.bubbles),
                 "lastBubble": self.bubbles[-1] if self.bubbles else "",
@@ -882,3 +884,53 @@ class TestJevDirectedRecovery:
         with pytest.raises(ConsoleError):
             console_submit(config=make_config(), driver=drv, sleep=NOOP)
         assert calls == []  # send paths stay advisory-only
+
+
+class TestAnswerSettled:
+    def test_stop_visible_blocks_even_when_length_stable(self):
+        info = {"submit_button": "disabled", "stop_button": True, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 5) == (False, "")
+
+    def test_submit_returned_disabled_counts_as_done(self):
+        # 提交后 composer 清空 ⇒ 按钮回归即 disabled（SKILL.md:226 live 语义）——完成！
+        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+
+    def test_submit_enabled_also_counts_as_done(self):
+        info = {"submit_button": "enabled", "stop_button": False, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+
+    def test_probe_unavailable_falls_back_to_length_only(self):
+        info = {"submit_button": "missing", "stop_button": False, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2) == (True, "length-only")
+
+    def test_still_streaming_not_settled(self):
+        info = {"submit_button": "missing", "stop_button": True, "lastProseLen": 200}
+        assert console._answer_settled(info, 120, 0) == (False, "")
+
+    def test_generating_text_is_advisory_only(self):
+        # 正文含 "generating" ⇒ generating 恒真，但不参与合取
+        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 120,
+                "generating": True}
+        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+
+    def test_zero_length_never_settles(self):
+        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 0}
+        assert console._answer_settled(info, 0, 2) == (False, "")
+
+
+class TestInfoProbe:
+    def test_probe_bilingual_submit_and_visible_stop(self):
+        assert 'aria-label="搜索"' in console._JS_INFO
+        assert 'aria-label="Submit"' in console._JS_INFO
+        assert 'checkVisibility' in console._JS_INFO
+        assert 'stop_button' in console._JS_INFO
+        assert 'lastProseLen' in console._JS_INFO and 'studied' in console._JS_INFO
+
+    def test_fake_driver_info_carries_new_fields(self):
+        d = ConsoleFakeDriver(answer="answer", share_tab=True)
+        console_fill("hi", config=make_config(), driver=d, sleep=NOOP)
+        console_submit(config=make_config(), driver=d, sleep=NOOP)
+        info = console._info(d)
+        assert "stop_button" in info
+        assert info["submit_button"] in ("enabled", "disabled", "missing")
