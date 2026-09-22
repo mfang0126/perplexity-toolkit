@@ -6,8 +6,19 @@ the completion-determination predicate:
 
   1_before_submit_with_draft   after fill, draft present, NOT submitted
   2_during_generation          within ~3s of a real submit (generating)
-  3_after_done_empty_composer  after the answer settles (composer cleared)
-  4_after_done_with_draft      fill again after completion (draft present)
+  3_after_done_empty_composer  after the NEW answer's 已研究 pill appears
+                               (``studied >= base + 1``) and the prose
+                               settles — NOT ``_gate_complete`` (its
+                               early-exit bug samples mid-stream)
+  4_after_done_with_draft      reload (heal DOM/state desync), then fill
+                               again after completion (draft present);
+                               a still-not-committed fill is flagged
+                               ``state4_fill_failed`` instead of raising
+
+v2 snapshot extras (every state): ``buttons_raw`` is an UNFILTERED dump of
+``button,[role="button"]`` (bare icon buttons included — the stop control
+is conditionally rendered and often unlabeled) and ``submit_parent_html``
+is the submit button's ``parentElement.outerHTML`` (trimmed to 1500 chars).
 
 Snapshots are written to
 ``<console_home()>/evidence/probe_submit_states-<epoch>.json``
@@ -44,18 +55,18 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 from perplexity_toolkit.config import get_config  # noqa: E402
 from perplexity_toolkit.console import (  # noqa: E402
-    DEFAULT_WAIT,
     POLL_INTERVAL,
     SELFCHECK_QUERY,
     SUBMIT_TIMEOUT,
     ConsoleError,
     _JS_CLICK_SUBMIT,  # noqa: F401 — imported for signature-parity checks
     _ensure_console_tab,
-    _gate_complete,
     _gate_fill,
     _gate_submit,
     _info,
+    _js,
     _make_driver,
+    _reload_console_tab,  # v2 state-4 desync healing
     console_home,
     load_state,
 )
@@ -72,6 +83,55 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── v2: unfiltered button dump + submit-button context ────────────────
+# The stop control is conditionally rendered in the generating state and
+# may carry no aria-label; filtering empty labels would hide it, so this
+# dump NEVER filters.
+_JS_BUTTONS = r"""(() => {
+  const out = [];
+  document.querySelectorAll('button,[role="button"]').forEach((n) => {
+    const r = n.getBoundingClientRect();
+    const cs = window.getComputedStyle(n);
+    out.push({
+      tag: String(n.tagName || '').toLowerCase(),
+      aria: n.getAttribute('aria-label') || '',
+      title: n.getAttribute('title') || '',
+      text: String(n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 16),
+      visible: Boolean(r.width && r.height && cs.visibility !== 'hidden'),
+      cls: String(n.className || '').slice(0, 40),
+    });
+  });
+  return JSON.stringify(out);
+})()"""
+
+_JS_SUBMIT_PARENT = r"""(() => {
+  const btn = document.querySelector('button[aria-label="提交"]');
+  const composer = document.querySelector('[contenteditable]');
+  const src = (btn && btn.parentElement) || (composer && composer.parentElement);
+  return JSON.stringify(String((src && src.outerHTML) || '').slice(0, 1500));
+})()"""
+
+
+def _dump_buttons(driver) -> list:
+    """Every ``button``/``[role="button"]`` node — no filtering at all."""
+    try:
+        raw = _js(driver, _JS_BUTTONS, [])
+    except Exception as exc:  # noqa: BLE001 — dump must never break a snapshot
+        return [{"_error": f"{type(exc).__name__}: {exc}"}]
+    if not isinstance(raw, list):
+        return [{"_error": "non-list buttons result", "_raw": repr(raw)}]
+    return raw
+
+
+def _submit_parent_html(driver) -> str:
+    """outerHTML of the submit button's parent (composer area as fallback)."""
+    try:
+        html = _js(driver, _JS_SUBMIT_PARENT, "")
+    except Exception as exc:  # noqa: BLE001
+        return f"<!-- dump failed: {type(exc).__name__}: {exc} -->"
+    return html if isinstance(html, str) else json.dumps(html, ensure_ascii=False)
+
+
 def _snapshot(driver) -> dict:
     """One _JS_INFO snapshot; ``.get()`` tolerates fields (e.g. stop_button)
     that a parallel change may not have added yet."""
@@ -80,6 +140,8 @@ def _snapshot(driver) -> dict:
         info = {"_error": "non-dict _JS_INFO result", "_raw": repr(info)}
     return {
         "ts": _now_iso(),
+        "buttons_raw": _dump_buttons(driver),
+        "submit_parent_html": _submit_parent_html(driver),
         "submit_button": info.get("submit_button"),
         "stop_button": info.get("stop_button"),   # may be absent (old _JS_INFO)
         "generating": info.get("generating"),
@@ -92,6 +154,49 @@ def _snapshot(driver) -> dict:
         "url": info.get("url"),
         "info": info,  # full raw _JS_INFO payload
     }
+
+
+def _wait_state3(driver, base_studied: int, *, wait_budget: float,
+                 poll: float, sleep) -> bool:
+    """v2 state-3 trigger — returns True on timeout.
+
+    Phase A: poll ``_info`` until ``studied >= base_studied + 1`` (the new
+    answer's 已研究 pill; one pill per answer, counter +1 on completion).
+    Phase B: after the pill, wait 5s AND require ``lastProseLen`` equal on
+    two consecutive samples (stable >= 2) before the snapshot.
+
+    ``_gate_complete`` is deliberately NOT used: its early-exit bug
+    returned true at 9 chars of prose, sampling mid-stream.
+    Total wait is capped by ``wait_budget`` (--wait-budget).
+    """
+    deadline = time.monotonic() + max(wait_budget, 0.0)
+
+    # Phase A — new answer's studied pill appears (+1 over baseline)
+    while True:
+        info = _info(driver)
+        if int(info.get("studied") or 0) >= int(base_studied) + 1:
+            break
+        if time.monotonic() >= deadline:
+            return True
+        sleep(max(poll, 0.01))
+
+    # Phase B — pill seen: wait 5s, then wait for prose stability
+    sleep(5.0)
+    stable = 0
+    last_len: int | None = None
+    while True:
+        info = _info(driver)
+        length = int(info.get("lastProseLen") or 0)
+        if last_len is not None and length == last_len and length > 0:
+            stable += 1
+        else:
+            stable = 0
+        last_len = length
+        if stable >= 2:      # 连续两次相等
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        sleep(max(poll, 0.01))
 
 
 def _emit(key: str, snap: dict) -> None:
@@ -127,8 +232,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--query", default=SELFCHECK_QUERY,
                         help="probe query used for fill/submit (default: %(default)s)")
-    parser.add_argument("--wait-budget", type=float, default=DEFAULT_WAIT,
-                        help="completion budget in seconds (default: %(default)s)")
+    parser.add_argument("--wait-budget", type=float, default=600.0,
+                        help="state-3 pill+settle budget in seconds "
+                             "(default: %(default)s)")
     parser.add_argument("--poll", type=float, default=POLL_INTERVAL,
                         help="poll interval in seconds (default: %(default)s)")
     parser.add_argument("--submit-timeout", type=float, default=SUBMIT_TIMEOUT,
@@ -144,8 +250,9 @@ def main(argv: list[str] | None = None) -> int:
     states: dict[str, dict] = {}
     rc = 0
     try:
-        # Baselines captured pre-fill; _gate_complete needs them and the
-        # probe bypasses the pending ledger on purpose (no state.json writes).
+        # Baselines captured pre-fill: state 3 waits for studied >= base+1
+        # (the new answer's 已研究 pill). The probe bypasses the pending
+        # ledger on purpose (no state.json writes).
         pre = _info(driver)
 
         # ── State 1: draft in composer, nothing submitted ──────────────
@@ -169,18 +276,43 @@ def main(argv: list[str] | None = None) -> int:
         states["2_during_generation"] = snap2
         _emit("2_during_generation", snap2)
 
-        # ── State 3: answer settled, composer expected empty ───────────
-        _gate_complete(driver, int(pre.get("studied") or 0),
-                       base_prose_count=int(pre.get("proseCount") or 0),
-                       wait_budget=args.wait_budget, poll=args.poll,
-                       sleep=time.sleep)
+        # ── State 3: 已研究药丸 (studied +1) 出现后稳定再快照 ───────────
+        state3_timeout = _wait_state3(
+            driver, int(pre.get("studied") or 0),
+            wait_budget=args.wait_budget, poll=args.poll, sleep=time.sleep)
         snap3 = _snapshot(driver)
+        if state3_timeout:
+            snap3["state3_timeout"] = True  # snapshot taken at budget expiry
         states["3_after_done_empty_composer"] = snap3
         _emit("3_after_done_empty_composer", snap3)
 
-        # ── State 4: fill again after completion, draft present ────────
-        _gate_fill(driver, args.query, sleep=time.sleep)
+        # ── State 4: reload 愈合 DOM/state desync 后再 fill ──────────────
+        try:
+            _reload_console_tab(cfg, state, sleep=time.sleep, driver=driver)
+        except Exception as exc:  # noqa: BLE001 — reload is best-effort healing
+            print(json.dumps({"state4_reload_error": f"{type(exc).__name__}: {exc}"},
+                             ensure_ascii=False, separators=(",", ":")),
+                  file=sys.stderr, flush=True)
+        state4_fill_failed = False
+        try:
+            filled = _gate_fill(driver, args.query, sleep=time.sleep)
+            if not (isinstance(filled, dict) and filled.get("ok")):
+                state4_fill_failed = True
+        except ConsoleError as exc:
+            # fill.not-committed after reload: snapshot anyway, do NOT abort
+            state4_fill_failed = True
+            print(json.dumps({"state4_fill_error": {"code": exc.code,
+                                                    "message": exc.message}},
+                             ensure_ascii=False, separators=(",", ":")),
+                  file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001 — never interrupt the probe here
+            state4_fill_failed = True
+            print(json.dumps({"state4_fill_error": f"{type(exc).__name__}: {exc}"},
+                             ensure_ascii=False, separators=(",", ":")),
+                  file=sys.stderr, flush=True)
         snap4 = _snapshot(driver)
+        if state4_fill_failed:
+            snap4["state4_fill_failed"] = True
         states["4_after_done_with_draft"] = snap4
         _emit("4_after_done_with_draft", snap4)
 
