@@ -65,27 +65,35 @@ FILL_SETTLE = 0.7             # seconds after a fill/CDP insert before readback
 SELFCHECK_QUERY = "用一句话回答：1+1 等于几？"
 
 
-def _answer_settled(info: dict, prev_len: int, stable: int) -> tuple[bool, str]:
+SUBMIT_ICON_IDLE = "#pplx-icon-arrow-up"   # live-verified idle action icon (2026-09-23)
+
+
+def _answer_settled(info: dict, prev_len: int, stable: int, *, new_seen: bool) -> tuple[bool, str]:
     """Completion decision for `_gate_complete` — deterministic signals only.
 
-    Semantics (live-verified): `submit_button`'s `disabled` means "editor internal
-    state is empty" — the STEADY STATE after submit (Perplexity clears the
-    composer). So any non-missing submit control counts as "returned";
-    `enabled`/`disabled` are both DONE. `generating` (whole-page text regex) and
-    the `studied` pill are ADVISORY ONLY (never in the conjunction).
+    Live-verified semantics (2026-09-23 four-state probe):
+    - the action button keeps aria-label 提交 while generating (disabled once the
+      composer clears) — its STATE cannot discriminate busy/done;
+    - its inner `svg use` ICON morphs instead: idle == SUBMIT_ICON_IDLE, any
+      other/unreadable-but-present icon == busy (inverted guard, no need to
+      know the stop icon's name);
+    - the 已研究 pill appears only on Pro-Search turns — advisory at best;
+    - the whole-page `generating` regex is pinned true by the model badge
+      (『… 正在思考』) — ignored entirely.
 
-    Returns (settled, signal); signal ∈ {"", "button+stable", "length-only"}.
+    done ⟺ new_seen ∧ length>0 ∧ length==prev_len ∧ stable≥2
+            ∧ no visible stop control ∧ action icon idle (or probe blank →
+              signal downgraded to "length-only").
     """
-    submit = info.get("submit_button") or "missing"
-    stop_visible = bool(info.get("stop_button"))
     length = int(info.get("lastProseLen") or 0)
-    if length <= 0 or length != prev_len or stable < 2:
+    if not new_seen or length <= 0 or length != prev_len or stable < 2:
         return False, ""
-    if stop_visible:
+    if info.get("stop_button"):
         return False, ""
-    if submit in ("enabled", "disabled"):
-        return True, "button+stable"
-    return True, "length-only"
+    icon = info.get("action_icon") or ""
+    if icon and icon != SUBMIT_ICON_IDLE:
+        return False, ""
+    return True, ("icon+stable" if icon == SUBMIT_ICON_IDLE else "length-only")
 
 # ──────────────────────────────────────────────────────────────
 # JS snippets (markers are relied on by tests: 'user-bubble', 'cloneNode',
@@ -113,6 +121,12 @@ _JS_INFO = r"""(() => {
         'button[aria-label="提交"],button[aria-label="搜索"],button[aria-label="Submit"]'
       );
       return b ? (b.disabled ? "disabled" : "enabled") : "missing";
+    })(),
+    action_icon: (() => {
+      const root = (typeof main !== 'undefined' && main) || document;
+      const b = root.querySelector('button[aria-label="提交"],button[aria-label="搜索"],button[aria-label="Submit"]');
+      const use = b ? b.querySelector('svg use') : null;
+      return use ? (use.getAttribute('xlink:href') || use.getAttribute('href') || '') : '';
     })(),
     stop_button: [...document.querySelectorAll(
       'button[aria-label*="停止"],button[aria-label*="Stop" i]'
@@ -690,49 +704,122 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
 
 def _gate_complete(driver: Any, base_studied: int, *,
                    base_prose_count: int = 0,
+                   base_len: Optional[int] = None,
                    wait_budget: float, poll: float,
-                   sleep: Callable[[float], None]) -> dict:
-    """Gate 3: the NEW turn's answer must appear, then settle.
+                   sleep: Callable[[float], None],
+                   monotonic: Callable[[], float] = time.monotonic,
+                   hard_cap_factor: float = 6.0,
+                   min_hard_cap: float = 900.0) -> dict:
+    """Gate 3: the NEW turn's answer must appear, then settle (v2, T4).
 
-    A stale answer from the previous turn must never satisfy this gate: the
-    turn-scoped answer count (``proseCount``) has to grow beyond the
-    pre-submit baseline before stability counts (observed live 2026-09-21:
-    a slow file-bearing answer let a naive stability check extract the
-    previous turn's answer).
+    A stale answer from the previous turn must never satisfy this gate: a new
+    answer has to be observed (``proseCount > base_prose_count`` or, when a
+    ``base_len`` baseline is supplied, ``lastProseLen > base_len``) before
+    stability counts (observed live 2026-09-21: a slow file-bearing answer let
+    a naive stability check extract the previous turn's answer).
+
+    v2 (live-verified 2026-09-23) adds three fail-safe layers on top of the
+    deterministic ``_answer_settled`` v2.2 predicate:
+
+    - **adaptive deadline** — a deadline reached while the answer is still
+      growing (or the action signal says busy) extends by ``extension_step``,
+      bounded by a hard cap (``wait_budget * hard_cap_factor`` / ``min_hard_cap``);
+      otherwise the gate fails closed with ``complete.timeout`` + human-review
+      escalation instead of returning a half-answer;
+    - **contradiction flag** — a busy signal with frozen content for ~20 polls
+      marks ``contradiction=True`` in the result (evidence conflict, reported
+      but not fatal on its own);
+    - **empty-probe fail-fast** — five consecutive empty WebBridge probes raise
+      ``bridge.probe-failed`` immediately rather than spinning to the deadline.
+
+    ``base_len=None`` (the call sites today) means no length baseline is
+    known: new-answer detection then relies on ``proseCount`` alone, exactly
+    as in v1.
     """
-    new_seen = False
-    done_seen = False
+    poll_eff = max(poll, 0.01)
+    start = monotonic()
+    deadline = start + max(wait_budget, 0.0)
+    hard_cap = max(wait_budget * hard_cap_factor, min_hard_cap)
+    extension_step = max(wait_budget / 2, 60.0)
+    # busy while frozen for ~20 polls (≈60s at the default poll=3.0)
+    stall_seconds = 20 * poll_eff
+    extensions = 0
+    prev_len = base_len if base_len is not None else -1
     stable = 0
-    last_len = -1
-    deadline = time.monotonic() + max(wait_budget, 0.0)
+    empty_run = 0
+    done_seen = False
+    new_seen = False
+    last_change_at = start
+    info: dict = {}
+    signal = ""
+    contradiction = False
     while True:
-        info = _info(driver)
+        info = _info(driver) or {}
+        if not info:
+            empty_run += 1
+            if empty_run >= 5:
+                raise ConsoleError(
+                    "complete",
+                    "WebBridge 探针连续返回空 — 桥不可达或页面未加载。"
+                    " / probe returned empty 5x",
+                    gates={"complete": {
+                        "ok": False, "probe_empty_runs": empty_run,
+                        "elapsed_s": round(monotonic() - start, 1),
+                        "escalation": "human-review"}},
+                    evidence=_evidence(driver),
+                    code="bridge.probe-failed")
+        else:
+            empty_run = 0
         if int(info.get("studied") or 0) > base_studied:
             done_seen = True
-        if int(info.get("proseCount") or 0) > base_prose_count:
-            new_seen = True
+        now = monotonic()
         length = int(info.get("lastProseLen") or 0)
-        stable = stable + 1 if (new_seen and length > 0 and length == last_len) else 0
-        last_len = length
-        if new_seen and stable >= 1 and done_seen:
+        if length != prev_len:
+            if length > prev_len:
+                last_change_at = now
+            prev_len, stable = length, 0
+        else:
+            stable += 1
+        busy = bool(info.get("stop_button")) or (
+            (info.get("action_icon") or "") not in ("", SUBMIT_ICON_IDLE))
+        if busy and stable * poll_eff >= stall_seconds:
+            contradiction = True   # busy signal present but content frozen
+        new_seen = ((base_len is not None and length > base_len)
+                    or int(info.get("proseCount") or 0) > base_prose_count)
+        settled, signal = _answer_settled(info, prev_len, stable,
+                                          new_seen=new_seen)
+        if settled:
             break
-        if new_seen and stable >= 2:
-            break
-        if time.monotonic() >= deadline:
-            break
-        sleep(max(poll, 0.01))
-
-    method = "pill+stable" if done_seen else ("stable-only" if stable >= 2 else "none")
-    ok = new_seen and last_len > 0 and stable >= 1
-    result = {"ok": ok, "new_seen": new_seen, "done_seen": done_seen, "stable": stable,
-              "chars": last_len, "method": method}
-    if not ok:
-        result["evidence"] = _evidence(driver)
-        raise ConsoleError(
-            "complete",
-            f"new turn's answer never settled (new_seen={new_seen}, method={method})",
-            gates={"complete": result}, code="complete.timeout")
-    return result
+        now = monotonic()
+        if now >= deadline:
+            growing_recently = (now - last_change_at) < extension_step
+            if (growing_recently or busy) and now < hard_cap:
+                deadline = now + extension_step
+                extensions += 1
+                continue
+            raise ConsoleError(
+                "complete",
+                f"等待答案完成超时（fail-closed）；可用 extract --peek 复核现场。"
+                f" / completion timeout after {now - start:.0f}s",
+                gates={"complete": {
+                    "ok": False, "new_seen": new_seen, "done_seen": done_seen,
+                    "stable": stable, "chars": length,
+                    "method": signal or "none",
+                    "evidence": _evidence(driver), "info": info,
+                    "elapsed_s": round(now - start, 1),
+                    "contradiction": contradiction,
+                    "escalation": "human-review"}},
+                code="complete.timeout")
+        sleep(poll_eff)
+    elapsed = monotonic() - start
+    return {"ok": True, "new_seen": new_seen, "done_seen": done_seen,
+            "method": signal or "length-only", "signal": signal or "length-only",
+            "stable": stable, "chars": int(info.get("lastProseLen") or 0),
+            "studied": int(info.get("studied") or 0),
+            "generating": bool(info.get("generating")),
+            "contradiction": contradiction,
+            "deadline_extensions": extensions, "elapsed_s": round(elapsed, 1),
+            "started": start, "completed": monotonic()}
 
 
 # ──────────────────────────────────────────────────────────────

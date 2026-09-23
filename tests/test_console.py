@@ -219,6 +219,7 @@ class ConsoleFakeDriver(BrowserDriver):
                 "title": "Perplexity",
                 "composer": self.composer,
                 "submit_button": self._btn_state(),
+                "action_icon": "#pplx-icon-arrow-up",
                 "stop_button": False,
                 "model": self.model,
                 "bubbles": len(self.bubbles),
@@ -886,37 +887,54 @@ class TestJevDirectedRecovery:
         assert calls == []  # send paths stay advisory-only
 
 
+IDLE_ICON = "#pplx-icon-arrow-up"   # live-verified idle action icon (2026-09-23)
+BUSY_ICON = "#pplx-icon-stop"       # any non-idle icon ⇒ busy (inverted guard)
+
+
 class TestAnswerSettled:
+    """v2.2 predicate (live-verified 2026-09-23): the action button's STATE
+    cannot discriminate busy/done (it stays 提交+disabled once the composer
+    clears); its inner `svg use` ICON morphs instead. The 已研究 pill only
+    appears on Pro-Search turns and the whole-page `generating` regex is
+    pinned true by the model badge — both advisory only."""
+
     def test_stop_visible_blocks_even_when_length_stable(self):
-        info = {"submit_button": "disabled", "stop_button": True, "lastProseLen": 120}
-        assert console._answer_settled(info, 120, 5) == (False, "")
+        info = {"stop_button": True, "action_icon": IDLE_ICON, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 5, new_seen=True) == (False, "")
 
-    def test_submit_returned_disabled_counts_as_done(self):
-        # 提交后 composer 清空 ⇒ 按钮回归即 disabled（SKILL.md:226 live 语义）——完成！
-        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 120}
-        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+    def test_non_idle_action_icon_blocks(self):
+        info = {"stop_button": False, "action_icon": BUSY_ICON, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 5, new_seen=True) == (False, "")
 
-    def test_submit_enabled_also_counts_as_done(self):
-        info = {"submit_button": "enabled", "stop_button": False, "lastProseLen": 120}
-        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+    def test_idle_icon_stable_and_new_answer_settles(self):
+        info = {"stop_button": False, "action_icon": IDLE_ICON, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2, new_seen=True) == (True, "icon+stable")
 
-    def test_probe_unavailable_falls_back_to_length_only(self):
-        info = {"submit_button": "missing", "stop_button": False, "lastProseLen": 120}
-        assert console._answer_settled(info, 120, 2) == (True, "length-only")
+    def test_blank_icon_downgrades_to_length_only(self):
+        info = {"stop_button": False, "action_icon": "", "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2, new_seen=True) == (True, "length-only")
 
-    def test_still_streaming_not_settled(self):
-        info = {"submit_button": "missing", "stop_button": True, "lastProseLen": 200}
-        assert console._answer_settled(info, 120, 0) == (False, "")
+    def test_missing_action_icon_key_downgrades_to_length_only(self):
+        # 兼容无 action_icon 的旧探针/假驱动：信号降级，不误判忙
+        info = {"stop_button": False, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 2, new_seen=True) == (True, "length-only")
 
-    def test_generating_text_is_advisory_only(self):
-        # 正文含 "generating" ⇒ generating 恒真，但不参与合取
-        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 120,
-                "generating": True}
-        assert console._answer_settled(info, 120, 2) == (True, "button+stable")
+    def test_without_new_answer_never_settles(self):
+        info = {"stop_button": False, "action_icon": IDLE_ICON, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 5, new_seen=False) == (False, "")
+
+    def test_unstable_length_never_settles(self):
+        info = {"stop_button": False, "action_icon": IDLE_ICON, "lastProseLen": 120}
+        assert console._answer_settled(info, 120, 1, new_seen=True) == (False, "")
 
     def test_zero_length_never_settles(self):
-        info = {"submit_button": "disabled", "stop_button": False, "lastProseLen": 0}
-        assert console._answer_settled(info, 0, 2) == (False, "")
+        info = {"stop_button": False, "action_icon": IDLE_ICON, "lastProseLen": 0}
+        assert console._answer_settled(info, 0, 2, new_seen=True) == (False, "")
+
+    def test_generating_text_is_advisory_only(self):
+        info = {"stop_button": False, "action_icon": IDLE_ICON, "lastProseLen": 120,
+                "generating": True}
+        assert console._answer_settled(info, 120, 2, new_seen=True) == (True, "icon+stable")
 
 
 class TestInfoProbe:
@@ -927,6 +945,12 @@ class TestInfoProbe:
         assert 'stop_button' in console._JS_INFO
         assert 'lastProseLen' in console._JS_INFO and 'studied' in console._JS_INFO
 
+    def test_probe_carries_action_icon(self):
+        # 真机实测：按钮状态分不了忙/闲，svg use 图标 ID 可以（T4 新增字段）
+        assert 'action_icon' in console._JS_INFO
+        assert 'svg use' in console._JS_INFO
+        assert 'xlink:href' in console._JS_INFO
+
     def test_fake_driver_info_carries_new_fields(self):
         d = ConsoleFakeDriver(answer="answer", share_tab=True)
         console_fill("hi", config=make_config(), driver=d, sleep=NOOP)
@@ -934,3 +958,142 @@ class TestInfoProbe:
         info = console._info(d)
         assert "stop_button" in info
         assert info["submit_button"] in ("enabled", "disabled", "missing")
+        assert info["action_icon"] == IDLE_ICON
+
+
+def _info_item(*, length=0, prose=0, stop=False, icon=IDLE_ICON,
+               generating=False, studied=0):
+    """One scripted _JS_INFO sample for TestGateCompleteV2."""
+    return {
+        "url": BASE_URL, "title": "Perplexity", "composer": "",
+        "submit_button": "disabled", "action_icon": icon,
+        "stop_button": stop, "model": "Gemini 3.8 Flash",
+        "bubbles": 1, "lastBubble": "hi\n13:40", "studied": studied,
+        "generating": generating, "proseCount": prose, "lastProseLen": length,
+    }
+
+
+class ScriptedInfoDriver(ConsoleFakeDriver):
+    """evaluate(info) yields a scripted sequence; the LAST item repeats
+    forever (never StopIteration)."""
+
+    def __init__(self, sequence, **kw):
+        super().__init__(share_tab=True, **kw)
+        assert sequence, "scripted driver needs at least one info sample"
+        self._script = [dict(x) for x in sequence]
+        self._script_i = 0
+
+    def evaluate(self, code):
+        if "user-bubble" in code:
+            item = self._script[min(self._script_i, len(self._script) - 1)]
+            self._script_i += 1
+            return dict(item)
+        return super().evaluate(code)
+
+
+class EmptyProbeDriver(ConsoleFakeDriver):
+    """The bridge answers every info probe with nothing."""
+
+    def evaluate(self, code):
+        if "user-bubble" in code:
+            return {}
+        return super().evaluate(code)
+
+
+class TestGateCompleteV2:
+    """_gate_complete v2: adaptive deadline + contradiction flag +
+    empty-probe fail-fast, decided by the v2.2 icon predicate."""
+
+    @staticmethod
+    def _gate(drv, **kw):
+        kw.setdefault("base_studied", 0)
+        kw.setdefault("base_prose_count", 1)
+        kw.setdefault("wait_budget", 5.0)
+        kw.setdefault("poll", 0.01)
+        kw.setdefault("sleep", NOOP)
+        return console._gate_complete(drv, kw.pop("base_studied"), **kw)
+
+    @staticmethod
+    def _fake_time(step):
+        """Injectable clock: sleep advances time deterministically."""
+        state = {"t": 0.0}
+
+        def mono():
+            return state["t"]
+
+        def slp(_seconds):
+            state["t"] += step
+
+        return mono, slp
+
+    def test_streaming_then_done_releases_with_icon_signal(self):
+        seq = [_info_item(length=120, prose=1, stop=True) for _ in range(3)]
+        seq += [_info_item(length=200, prose=2) for _ in range(3)]
+        res = self._gate(ScriptedInfoDriver(seq))
+        assert res["ok"] is True
+        assert res["signal"] == "icon+stable"
+        assert res["contradiction"] is False
+
+    def test_composer_clears_fill_submit_then_gate_releases(self):
+        # composer_clears ⇒ 提交后按钮回 disabled 稳态；icon 是放行依据
+        d = ConsoleFakeDriver(composer_clears=True, share_tab=True)
+        console_fill("hi", config=make_config(), driver=d, sleep=NOOP)
+        console_submit(config=make_config(), driver=d, sleep=NOOP)
+        res = console._gate_complete(d, 0, base_prose_count=0,
+                                     wait_budget=5.0, poll=0.01, sleep=NOOP)
+        assert res["ok"] is True
+        assert res["signal"] == "icon+stable"
+
+    def test_generating_noise_does_not_block_release(self):
+        # generating 被 model 徽标钉死恒真 ⇒ 不参与放行判定
+        seq = [_info_item(length=120, prose=1, stop=True, generating=True)
+               for _ in range(3)]
+        seq += [_info_item(length=200, prose=2, generating=True) for _ in range(3)]
+        res = self._gate(ScriptedInfoDriver(seq))
+        assert res["ok"] is True
+        assert res["signal"] == "icon+stable"
+        assert res["generating"] is True
+
+    def test_empty_probe_fails_fast(self):
+        with pytest.raises(ConsoleError) as exc:
+            self._gate(EmptyProbeDriver(), wait_budget=1.0)
+        assert exc.value.code == "bridge.probe-failed"
+
+    def test_growing_answer_extends_deadline(self):
+        mono, slp = self._fake_time(0.5)
+        seq = [_info_item(length=100 + i, prose=2, stop=True) for i in range(40)]
+        seq.append(_info_item(length=400, prose=2))
+        res = self._gate(ScriptedInfoDriver(seq), base_len=50, wait_budget=6.0,
+                         poll=0.5, sleep=slp, monotonic=mono)
+        assert res["ok"] is True
+        assert res["deadline_extensions"] >= 1
+        assert res["elapsed_s"] > 6
+
+    def test_busy_but_frozen_content_flags_contradiction(self):
+        # 忙信号在但内容 25 拍不动 ⇒ 证据矛盾只标记，不阻断最终放行
+        seq = [_info_item(length=100, prose=1, icon=BUSY_ICON) for _ in range(25)]
+        seq += [_info_item(length=200, prose=2) for _ in range(3)]
+        res = self._gate(ScriptedInfoDriver(seq), poll=0.02, base_len=50)
+        assert res["ok"] is True
+        assert res["contradiction"] is True
+
+    def test_stuck_busy_times_out_fail_closed(self):
+        mono, slp = self._fake_time(1.0)
+        drv = ScriptedInfoDriver([_info_item(length=300, prose=1, stop=True)])
+        with pytest.raises(ConsoleError) as exc:
+            self._gate(drv, base_len=100, wait_budget=5.0, poll=1.0,
+                       sleep=slp, monotonic=mono)
+        assert exc.value.code == "complete.timeout"
+        detail = exc.value.gates["complete"]
+        assert detail["escalation"] == "human-review"
+
+    def test_never_new_answer_never_releases(self):
+        # 长度从未超 base_len、proseCount 从未超 base_prose_count ⇒ 即使
+        # 稳定也不放行（stale answer 门槛），最终 fail-closed 超时
+        mono, slp = self._fake_time(1.0)
+        drv = ScriptedInfoDriver([_info_item(length=250, prose=1)])
+        with pytest.raises(ConsoleError) as exc:
+            self._gate(drv, base_len=250, base_prose_count=1,
+                       wait_budget=5.0, poll=1.0, sleep=slp, monotonic=mono)
+        assert exc.value.code == "complete.timeout"
+        assert exc.value.gates["complete"]["new_seen"] is False
