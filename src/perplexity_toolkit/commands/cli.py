@@ -259,9 +259,16 @@ def cmd_console(args) -> int:
                                  f"{j.get('answers_question'):.2f}, complete={j.get('complete'):.2f})")
                 else:
                     lines.append(f"judge: {j.get('status')} ({j.get('reason', '')})")
+            scroll = (p.get("gates") or {}).get("scroll") or {}
+            if scroll.get("settled") is False:
+                lines.append("⚠️ scroll unsettled（懒渲染可能未完成，"
+                             "extract --peek 复核）")
+            if p.get("truncation_risk") is True:
+                lines.append("⚠️ 可能截断（尾部无终止符且仍在生成）")
             return lines
         ok = _console_run_step(console_extract, fmt,
-                               kwargs={"judge": getattr(args, "judge", None)},
+                               kwargs={"judge": getattr(args, "judge", None),
+                                       "strict": getattr(args, "strict", False)},
                                text_lines=_t_extract)
         return 0 if ok else 1
 
@@ -546,6 +553,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ask Jev to judge the extracted answer (advisory)")
     pc.add_argument("--no-judge", dest="judge", action="store_false",
                     help="Disable the Jev judge for this call")
+    pc.add_argument("--strict", action="store_true",
+                    help="Fail with extract.truncation-risk when the answer "
+                         "looks truncated (advisory flag by default)")
     pc = csub.add_parser("send", help="Stage + submit in one call (fill + submit)")
     pc.add_argument("query")
     pc.add_argument("--task", default="default")

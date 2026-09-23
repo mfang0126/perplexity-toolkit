@@ -155,6 +155,29 @@ _JS_PROSE = r"""(() => {
   });
 })()"""
 
+# Scroll the answer's scrollable container to its bottom before extraction.
+# Discovery: walk up from the LAST div.prose to the first overflow-y
+# auto/scroll ancestor with real overflow (scrollHeight > clientHeight + 4),
+# falling back to document.scrollingElement. Live DOM (2026-09-23): the
+# container found this way is `div.scrollable-container.overflow-auto`
+# (inside <main>, the prose's scrollable ancestor).
+_JS_SCROLL = r"""(() => {
+  const m = document.querySelector("main");
+  const lastProse = [...(m ? m.querySelectorAll("div.prose") : document.querySelectorAll("div.prose"))].pop();
+  let container = null;
+  for (let n = lastProse; n && n !== document.body; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if ((oy === "auto" || oy === "scroll") && n.scrollHeight > n.clientHeight + 4) { container = n; break; }
+  }
+  if (!container) container = document.scrollingElement || document.documentElement;
+  const before = container.scrollTop;
+  container.scrollTop = container.scrollHeight;
+  window.scrollTo(0, document.body.scrollHeight);
+  return { bottom: container.scrollTop + container.clientHeight >= container.scrollHeight - 8,
+           height: container.scrollHeight, scrolled: container.scrollTop !== before,
+           container: container.tagName + (container.className ? "." + String(container.className).split(" ")[0] : "") };
+})()"""
+
 _JS_SOURCES = r"""(() => {
   const main = document.querySelector('main');
   if (!main) return JSON.stringify([]);
@@ -375,7 +398,8 @@ def _pending_require(state: dict, *, stage: str) -> dict:
 
 
 def _log_run(op: str, *, ok: bool = True, gate: Optional[str] = None,
-             url: Optional[str] = None, elapsed: Optional[float] = None) -> None:
+             url: Optional[str] = None, elapsed: Optional[float] = None,
+             truncation_risk: Optional[bool] = None) -> None:
     """Append one compact line to runs.jsonl (best-effort observability)."""
     try:
         path = console_home() / "runs.jsonl"
@@ -387,6 +411,8 @@ def _log_run(op: str, *, ok: bool = True, gate: Optional[str] = None,
             rec["url"] = url
         if elapsed is not None:
             rec["elapsed_s"] = round(elapsed, 1)
+        if truncation_risk is not None:
+            rec["truncation_risk"] = bool(truncation_risk)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
@@ -1151,6 +1177,60 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
             raise
 
 
+def _scroll_to_bottom(driver: Any, *, prose_len: Callable[[], int],
+                      max_rounds: int = 6,
+                      sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Scroll the answer container to its bottom and wait for a settle.
+
+    Probe ``_JS_SCROLL`` discovers the last prose's scrollable ancestor
+    (live: ``div.scrollable-container.overflow-auto``; falls back to
+    ``document.scrollingElement``). Settled ⟺ two consecutive EQUAL, non-zero
+    prose-length readings AND the probe reports the bottom reached (length
+    equality, not heights — lazy rendering keeps appending).
+    """
+    prev: Optional[int] = None
+    res: dict = {}
+    container = ""
+    cur = 0
+    settled = False
+    rounds = 0
+    for rounds in range(1, max(1, max_rounds) + 1):
+        raw = _js(driver, _JS_SCROLL, {})
+        res = raw if isinstance(raw, dict) else {}
+        if res.get("container"):
+            container = str(res["container"])
+        cur = int(prose_len() or 0)
+        if cur > 0 and cur == prev and bool(res.get("bottom")):
+            settled = True
+            break
+        prev = cur
+        if rounds < max_rounds:
+            sleep(0.2)
+    out: dict = {"settled": settled, "rounds": rounds, "container": container,
+                 "prose": cur}
+    if not settled:
+        out["warning"] = "complete.scroll-unsettled"
+    return out
+
+
+_TERMINATORS = "。！？.!?;；:：）)】]`\"'”’…—|>"
+
+
+def _truncation_risk(text: str, *, still_generating: bool) -> bool:
+    """Advisory truncation flag: risky ⟺ still busy ∧ tail has no terminator.
+
+    still_generating must be a busy signal (stop control visible OR action icon
+    != idle) — NEVER the whole-page `generating` regex (pinned true by the
+    model badge 『… 正在思考』)."""
+    tail = (text or "").rstrip("​ \n\t")
+    return bool(still_generating and tail and tail[-1] not in _TERMINATORS)
+
+
+def _truncation_risk_fields(text: str, *, still_generating: bool) -> dict:
+    risk = _truncation_risk(text, still_generating=still_generating)
+    return {"answer_terminated": not risk, "truncation_risk": risk}
+
+
 def _extract_step(drv: Any, state: dict, cfg: Config, *,
                   sleep: Callable[[float], None],
                   pending: Optional[dict] = None,
@@ -1166,6 +1246,14 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
     if expand == "clicked":
         sleep(1.0)
     gates["expand"] = expand
+
+    # T5: lazy rendering appends while scrolling — reach the bottom first and
+    # record the settle verdict as its own gate (advisory, never blocks).
+    scroll_out = _scroll_to_bottom(
+        drv,
+        prose_len=lambda: int((_info(drv) or {}).get("lastProseLen") or 0),
+        sleep=sleep)
+    gates["scroll"] = scroll_out
 
     prose = _js(drv, _JS_PROSE, {})
     if (not isinstance(prose, dict) or not prose.get("found")
@@ -1187,6 +1275,11 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
 
     post = _info(drv)
     url = post.get("url") or ""
+    # T6: busy = stop control visible OR non-idle action icon — the
+    # whole-page `generating` regex is pinned true by the model badge, so it
+    # must never feed this signal. Missing info ⇒ busy=False (flag only).
+    busy = bool(post.get("stop_button")) or (
+        (post.get("action_icon") or "") not in ("", SUBMIT_ICON_IDLE))
     if pending:
         task_name = pending.get("task") or "default"
         q = pending.get("query") or ""
@@ -1213,6 +1306,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
         "url": url,
         "title": post.get("title") or "",
         "model": post.get("model") or "",
+        **_truncation_risk_fields(prose["text"], still_generating=busy),
     }
 
 
@@ -1437,8 +1531,13 @@ def console_wait(*, config: Optional[Config] = None, driver: Any = None,
 
 def console_extract(*, config: Optional[Config] = None, driver: Any = None,
                     judge: Optional[bool] = None,
+                    strict: bool = False,
                     sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Extract the newest answer (+sources); consumes the staged turn."""
+    """Extract the newest answer (+sources); consumes the staged turn.
+
+    ``strict`` turns the advisory truncation flag into a hard failure
+    (``extract.truncation-risk``); by default a risky answer is only marked.
+    """
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
@@ -1451,11 +1550,17 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
         out["task"] = (pending or {}).get("task") or state.get("active_task")
         out["judge"] = console_judge.judge_extraction(
             (pending or {}).get("query") or "", out.get("answer") or "", flag=judge)
-        _log_run("extract", ok=True, url=out.get("url"))
+        _log_run("extract", ok=True, url=out.get("url"),
+                 truncation_risk=out.get("truncation_risk"))
         return out
 
-    return _run_with_jev_recovery("extract", _once, judge=judge, cfg=cfg, state=state,
-                                  sleep=sleep, driver=drv)
+    out = _run_with_jev_recovery("extract", _once, judge=judge, cfg=cfg, state=state,
+                                 sleep=sleep, driver=drv)
+    if strict and out.get("truncation_risk"):
+        raise ConsoleError("extract", "答案疑似截断（strict 模式）",
+                           gates={"extract": {"truncation_risk": True}},
+                           code="extract.truncation-risk")
+    return out
 
 
 def console_send(query: str, *, task: str = "default", new_thread: bool = False,

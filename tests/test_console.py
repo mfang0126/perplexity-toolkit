@@ -45,6 +45,7 @@ from perplexity_toolkit.console import (
     save_state,
 )
 from perplexity_toolkit.drivers.base import BrowserDriver
+from perplexity_toolkit.commands.cli import build_parser, cmd_console
 
 
 def make_config():
@@ -65,7 +66,7 @@ class ConsoleFakeDriver(BrowserDriver):
                  fill_appends=False, race_draft_after=None,
                  race_draft_text="旧草稿", force_btn_disabled=False,
                  btn_missing_first_click=0, desync_until_reload=False,
-                 desync_recover_after=1):
+                 desync_recover_after=1, busy=False):
         self.url = url
         self.answer = answer
         self.share_tab = share_tab
@@ -112,6 +113,7 @@ class ConsoleFakeDriver(BrowserDriver):
         self.misfire_until_reload = False
         self.pollute_first_fill = False
         self._polluted_once = False
+        self.busy = busy   # still-generating page: busy stop + non-idle icon
 
     def _btn_state(self):
         """The submit button mirrors the editor's internal state."""
@@ -200,6 +202,11 @@ class ConsoleFakeDriver(BrowserDriver):
         if "cloneNode" in code:
             text = self.prose[-1] if self.prose else ""
             return {"found": bool(self.prose), "text": text, "raw": text}
+        if "scrollTop" in code:
+            # fake page is always scrolled to the bottom (live container:
+            # div.scrollable-container.overflow-auto)
+            return {"bottom": True, "height": 1000, "scrolled": False,
+                    "container": "DIV.scrollable-container"}
         if "user-bubble" in code:
             self._info_calls += 1
             if (self.race_draft_after is not None and not self._race_applied
@@ -219,8 +226,8 @@ class ConsoleFakeDriver(BrowserDriver):
                 "title": "Perplexity",
                 "composer": self.composer,
                 "submit_button": self._btn_state(),
-                "action_icon": "#pplx-icon-arrow-up",
-                "stop_button": False,
+                "action_icon": BUSY_ICON if self.busy else IDLE_ICON,
+                "stop_button": self.busy,
                 "model": self.model,
                 "bubbles": len(self.bubbles),
                 "lastBubble": self.bubbles[-1] if self.bubbles else "",
@@ -1097,3 +1104,278 @@ class TestGateCompleteV2:
                        wait_budget=5.0, poll=1.0, sleep=slp, monotonic=mono)
         assert exc.value.code == "complete.timeout"
         assert exc.value.gates["complete"]["new_seen"] is False
+
+
+# ──────────────────────────────────────────────────────────────
+# T5: scroll-to-bottom before extraction (2026-09-23)
+# ──────────────────────────────────────────────────────────────
+
+class ScrollScriptedDriver(ConsoleFakeDriver):
+    """evaluate(_JS_SCROLL) yields scripted samples; the LAST repeats forever."""
+
+    def __init__(self, scroll_seq, **kw):
+        super().__init__(share_tab=True, **kw)
+        assert scroll_seq, "scroll script needs at least one sample"
+        self._scroll = [dict(x) for x in scroll_seq]
+        self._scroll_i = 0
+
+    def evaluate(self, code):
+        if "scrollTop" in code:
+            item = self._scroll[min(self._scroll_i, len(self._scroll) - 1)]
+            self._scroll_i += 1
+            return dict(item)
+        return super().evaluate(code)
+
+
+def _scroll_item(bottom=True, height=1000, scrolled=True,
+                 container="DIV.scrollable-container"):
+    return {"bottom": bottom, "height": height, "scrolled": scrolled,
+            "container": container}
+
+
+class TestScrollToBottom:
+    """滚动到底探针：真机滚动容器是 div.scrollable-container.overflow-auto
+    （main 内 prose 的可滚动祖先，2026-09-23 DOM 实测）。"""
+
+    def test_probe_discovers_scrollable_ancestor(self):
+        # 发现算法：从最后一个 div.prose 向上找 overflow-y 可滚动祖先，
+        # 兜底 document.scrollingElement
+        assert "div.prose" in console._JS_SCROLL
+        assert "overflowY" in console._JS_SCROLL
+        assert "scrollHeight" in console._JS_SCROLL
+        assert "scrollingElement" in console._JS_SCROLL
+
+    def test_container_found_and_two_equal_reads_settle(self):
+        drv = ScrollScriptedDriver([_scroll_item(),
+                                    _scroll_item(scrolled=False)])
+        res = console._scroll_to_bottom(drv, prose_len=lambda: 42, sleep=NOOP)
+        assert res["settled"] is True
+        assert res["rounds"] == 2
+        assert res["container"] == "DIV.scrollable-container"
+        assert res["prose"] == 42
+        assert "warning" not in res
+
+    def test_unsettled_carries_warning_code(self):
+        drv = ScrollScriptedDriver([_scroll_item(bottom=False)])
+        res = console._scroll_to_bottom(drv, prose_len=lambda: 42,
+                                        sleep=NOOP, max_rounds=3)
+        assert res["settled"] is False
+        assert res["warning"] == "complete.scroll-unsettled"
+
+    def test_empty_prose_never_settles(self):
+        # 等长但长度为 0 不算 settle（lazy 渲染还没出内容）
+        drv = ScrollScriptedDriver([_scroll_item()])
+        res = console._scroll_to_bottom(drv, prose_len=lambda: 0,
+                                        sleep=NOOP, max_rounds=3)
+        assert res["settled"] is False
+        assert res["warning"] == "complete.scroll-unsettled"
+
+    def test_non_dict_probe_result_treated_as_empty(self):
+        class IntDriver(ConsoleFakeDriver):
+            def evaluate(self, code):
+                if "scrollTop" in code:
+                    return 7
+                return super().evaluate(code)
+
+        drv = IntDriver(share_tab=True)
+        res = console._scroll_to_bottom(drv, prose_len=lambda: 42,
+                                        sleep=NOOP, max_rounds=2)
+        assert isinstance(res, dict)
+        assert res["settled"] is False
+
+    def test_extract_result_carries_scroll_gate(self):
+        drv = ScrollScriptedDriver([_scroll_item()], answer="答案 42。")
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP)
+        assert res["gates"]["scroll"]["settled"] is True
+        assert res["gates"]["scroll"]["container"] == "DIV.scrollable-container"
+
+
+# ──────────────────────────────────────────────────────────────
+# T6: truncation-risk flag (advisory by default; strict is a hard gate)
+# ──────────────────────────────────────────────────────────────
+
+class TestTruncationRisk:
+    def test_busy_without_terminator_is_risk(self):
+        assert console._truncation_risk("答案写到一半",
+                                        still_generating=True) is True
+
+    def test_terminator_tail_is_not_risk(self):
+        assert console._truncation_risk("答案 42。",
+                                        still_generating=True) is False
+
+    def test_idle_is_never_risk(self):
+        # 无论尾部有没有终止符，不忙就不算截断
+        assert console._truncation_risk("答案写到一半",
+                                        still_generating=False) is False
+        assert console._truncation_risk("答案 42。",
+                                        still_generating=False) is False
+
+    def test_empty_text_is_not_risk(self):
+        assert console._truncation_risk("", still_generating=True) is False
+
+    def test_field_names_and_values(self):
+        risky = console._truncation_risk_fields("一半", still_generating=True)
+        assert risky == {"answer_terminated": False, "truncation_risk": True}
+        done = console._truncation_risk_fields("完。", still_generating=True)
+        assert done == {"answer_terminated": True, "truncation_risk": False}
+
+    @staticmethod
+    def _busy_extract(answer):
+        """fill → submit → extract against a still-generating fake page."""
+        drv = ConsoleFakeDriver(share_tab=True, answer=answer, busy=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        return console_extract(config=make_config(), driver=drv, sleep=NOOP), drv
+
+    @staticmethod
+    def _idle_extract(answer):
+        drv = ConsoleFakeDriver(share_tab=True, answer=answer)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        return console_extract(config=make_config(), driver=drv, sleep=NOOP), drv
+
+    def test_extract_flags_truncation_while_busy(self):
+        res, _ = self._busy_extract("答案写到一半")
+        assert res["truncation_risk"] is True
+        assert res["answer_terminated"] is False
+
+    def test_extract_terminated_busy_answer_not_flagged(self):
+        res, _ = self._busy_extract("答案 42。")
+        assert res["truncation_risk"] is False
+        assert res["answer_terminated"] is True
+
+    def test_extract_idle_answer_not_flagged(self):
+        res, _ = self._idle_extract("答案写到一半")
+        assert res["truncation_risk"] is False
+        assert res["answer_terminated"] is True
+
+    def test_default_extract_only_flags_no_raise(self):
+        res, _ = self._busy_extract("答案写到一半")
+        assert res["ok"] is True
+        assert res["truncation_risk"] is True
+
+    def test_strict_extract_raises_truncation_error(self):
+        drv = ConsoleFakeDriver(share_tab=True, answer="答案写到一半",
+                                busy=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        with pytest.raises(ConsoleError) as exc:
+            console_extract(config=make_config(), driver=drv, sleep=NOOP,
+                            strict=True)
+        assert exc.value.code == "extract.truncation-risk"
+
+    def test_strict_extract_passes_when_answer_terminated(self):
+        drv = ConsoleFakeDriver(share_tab=True, answer="答案 42。")
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP,
+                              strict=True)
+        assert res["ok"] is True
+
+    def test_log_run_records_truncation_risk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(console, "console_home", lambda: tmp_path)
+        console._log_run("extract", ok=True, url="u", truncation_risk=True)
+        rec = json.loads((tmp_path / "runs.jsonl").read_text(
+            encoding="utf-8").strip().splitlines()[-1])
+        assert rec["truncation_risk"] is True
+
+    def test_log_run_omits_absent_truncation_risk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(console, "console_home", lambda: tmp_path)
+        console._log_run("extract", ok=True, url="u")
+        rec = json.loads((tmp_path / "runs.jsonl").read_text(
+            encoding="utf-8").strip().splitlines()[-1])
+        assert "truncation_risk" not in rec
+
+    def test_extract_success_path_logs_truncation_risk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(console, "console_home", lambda: tmp_path)
+        drv = ConsoleFakeDriver(share_tab=True, answer="答案写到一半",
+                                busy=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        console_extract(config=make_config(), driver=drv, sleep=NOOP)
+        lines = [json.loads(x) for x in
+                 (tmp_path / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+        rec = [x for x in lines if x.get("op") == "extract"][-1]
+        assert rec["truncation_risk"] is True
+
+
+# ──────────────────────────────────────────────────────────────
+# T6 CLI: extract warnings + --strict wiring
+# ──────────────────────────────────────────────────────────────
+
+class TestCliExtractWarnings:
+    """`_t_extract` must surface the scroll/truncation verdicts as text."""
+
+    @staticmethod
+    def _payload(**over):
+        p = {"ok": True, "answer": "半截答案", "url": "u", "model": "m",
+             "sources": [], "gates": {}, "judge": {"enabled": False}}
+        p.update(over)
+        return p
+
+    @staticmethod
+    def _run(monkeypatch, capsys, payload, extra=(), expect_rc=0):
+        captured = {}
+
+        def fake(**kw):
+            captured.update(kw)
+            return payload
+
+        monkeypatch.setattr(console, "console_extract", fake)
+        args = build_parser().parse_args(["console", "extract", *extra])
+        rc = cmd_console(args)
+        return rc, capsys.readouterr().out, captured
+
+    def test_scroll_unsettled_warning_printed(self, monkeypatch, capsys):
+        payload = self._payload(
+            gates={"scroll": {"settled": False,
+                              "warning": "complete.scroll-unsettled"}})
+        rc, out, _ = self._run(monkeypatch, capsys, payload)
+        assert rc == 0
+        assert "⚠️ scroll unsettled（懒渲染可能未完成，extract --peek 复核）" in out
+
+    def test_truncation_warning_printed(self, monkeypatch, capsys):
+        payload = self._payload(truncation_risk=True)
+        rc, out, _ = self._run(monkeypatch, capsys, payload)
+        assert rc == 0
+        assert "⚠️ 可能截断（尾部无终止符且仍在生成）" in out
+
+    def test_no_warnings_when_clean(self, monkeypatch, capsys):
+        payload = self._payload(gates={"scroll": {"settled": True}},
+                                truncation_risk=False)
+        rc, out, _ = self._run(monkeypatch, capsys, payload)
+        assert rc == 0
+        assert "⚠️" not in out
+
+    def test_strict_flag_forwarded(self, monkeypatch, capsys):
+        payload = self._payload(gates={"scroll": {"settled": True}},
+                                truncation_risk=False)
+        rc, out, captured = self._run(monkeypatch, capsys, payload,
+                                      extra=("--strict",))
+        assert rc == 0
+        assert captured.get("strict") is True
+
+    def test_strict_defaults_to_false(self, monkeypatch, capsys):
+        payload = self._payload(gates={"scroll": {"settled": True}},
+                                truncation_risk=False)
+        rc, out, captured = self._run(monkeypatch, capsys, payload)
+        assert rc == 0
+        assert captured.get("strict") is False
+
+    def test_strict_truncation_error_fails_cli(self, monkeypatch, capsys):
+        from perplexity_toolkit import console_judge
+        monkeypatch.setattr(console_judge, "route_hint",
+                            lambda *a, **k: {"status": "skipped"})
+
+        def raise_strict(**kw):
+            raise ConsoleError("extract", "答案疑似截断（strict 模式）",
+                               code="extract.truncation-risk")
+
+        monkeypatch.setattr(console, "console_extract", raise_strict)
+        args = build_parser().parse_args(["console", "extract", "--strict"])
+        rc = cmd_console(args)
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "extract.truncation-risk" in out
