@@ -114,7 +114,8 @@ def cmd_console(args) -> int:
                                  new_thread=args.new_thread,
                                  wait_budget=args.wait_budget,
                                  files=getattr(args, "file", None),
-                                 judge=getattr(args, "judge", None))
+                                 judge=getattr(args, "judge", None),
+                                 model=getattr(args, "model", None))
         except ConsoleError as exc:
             _console_fail(exc, fmt)
             return 1
@@ -502,6 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     csub = p.add_subparsers(dest="console_action")
     pc = csub.add_parser("ask", help="Ask the console; creates or continues a task thread")
     pc.add_argument("query")
+    pc.add_argument("--model", "-m", help="Switch model before asking (e.g. \"Grok 4.6\")")
     pc.add_argument("--task", default="default", help="Task name; one task = one thread")
     pc.add_argument("--new-thread", action="store_true",
                     help="Start a new Perplexity thread in the same tab")

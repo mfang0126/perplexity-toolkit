@@ -492,7 +492,7 @@ def _url_matches(current: str, target: str) -> bool:
     return cur.startswith(tgt)
 
 
-def _js(driver: Any, code: str, default: Any = None) -> Any:
+def _js(driver: Any, code: str, default: Any = None, *, mutating: bool = True) -> Any:
     """Run a JS snippet and normalize its result.
 
     String results are attempted as JSON; a plain non-JSON string (e.g.
@@ -500,8 +500,12 @@ def _js(driver: Any, code: str, default: Any = None) -> Any:
     Only empty/None results fall back to ``default``. (The old behavior
     silently replaced plain-string results with the default, which made a
     successful submit click look like 'no-button'.)
+
+    ``mutating=False`` marks read-only probes (may be retried on timeout).
+    ``mutating=True`` (default) — no retry; important for submit/file-inject calls
+    where a retry would double-fire the action.
     """
-    value = driver.evaluate(code)
+    value = driver.evaluate(code, mutating=mutating)
     if isinstance(value, str):
         if value == "":
             return default
@@ -513,7 +517,7 @@ def _js(driver: Any, code: str, default: Any = None) -> Any:
 
 
 def _info(driver: Any) -> dict:
-    value = _js(driver, _JS_INFO, {})
+    value = _js(driver, _JS_INFO, {}, mutating=False)
     return value if isinstance(value, dict) else {}
 
 
@@ -1284,7 +1288,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
         sleep=sleep)
     gates["scroll"] = scroll_out
 
-    prose = _js(drv, _JS_PROSE, {})
+    prose = _js(drv, _JS_PROSE, {}, mutating=False)
     if (not isinstance(prose, dict) or not prose.get("found")
             or not _normalize(prose.get("text"))):
         gates["extract"] = {"ok": False}
@@ -1294,11 +1298,11 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
 
     file_names = list((pending or {}).get("files") or [])
     if file_names:
-        payload = _js(drv, _JS_CHIPS, {})
+        payload = _js(drv, _JS_CHIPS, {}, mutating=False)
         remaining = payload.get("attachments") if isinstance(payload, dict) else []
         gates["send"] = {"chips_cleared": not any(n in (remaining or []) for n in file_names)}
 
-    sources = _js(drv, _JS_SOURCES, [])
+    sources = _js(drv, _JS_SOURCES, [], mutating=False)
     if not isinstance(sources, list):
         sources = []
 
@@ -1348,6 +1352,7 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
                 submit_timeout: float = SUBMIT_TIMEOUT,
                 submit_recheck_timeout: float = 6.0,
                 judge: Optional[bool] = None,
+                model: Optional[str] = None,
                 config: Optional[Config] = None, driver: Any = None,
                 sleep: Callable[[float], None] = time.sleep) -> dict:
     """Ask the resident console one question, with every step verified.
@@ -1360,6 +1365,8 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
+    if model:
+        console_set_model(model, config=cfg, driver=drv, sleep=sleep)
     started = time.monotonic()
 
     try:
@@ -1768,7 +1775,7 @@ def console_detach(name: str, *, config: Optional[Config] = None, driver: Any = 
         raise ConsoleError("file", f"attachment {name!r} not found as a chip",
                            code="file.chip-missing")
     sleep(1.0)
-    chips = _js(drv, _JS_CHIPS, {})
+    chips = _js(drv, _JS_CHIPS, {}, mutating=False)
     remaining = chips.get("attachments") if isinstance(chips, dict) else []
     if name in (remaining or []):
         raise ConsoleError("file", f"attachment {name!r} still present after remove",
@@ -1791,7 +1798,7 @@ def console_files(*, config: Optional[Config] = None, driver: Any = None,
     state = load_state()
     drv = driver or _make_driver(cfg, state)
     _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
-    chips = _js(drv, _JS_CHIPS, {})
+    chips = _js(drv, _JS_CHIPS, {}, mutating=False)
     attachments = chips.get("attachments") if isinstance(chips, dict) else []
     pending = _pending(state)
     return {"ok": True, "chips": attachments,

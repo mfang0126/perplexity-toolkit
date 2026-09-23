@@ -197,7 +197,7 @@ class ConsoleFakeDriver(BrowserDriver):
             self.model_menu_open = False
         return {"ok": True}
 
-    def evaluate(self, code):
+    def evaluate(self, code, **kwargs):
         self.calls.append(("evaluate", code[:60]))
         if "cloneNode" in code:
             text = self.prose[-1] if self.prose else ""
@@ -967,6 +967,18 @@ class TestInfoProbe:
         assert info["submit_button"] in ("enabled", "disabled", "missing")
         assert info["action_icon"] == IDLE_ICON
 
+    def test_info_passes_mutating_false(self):
+        """_info calls _js with mutating=False so the WebBridge can retry
+        the probe on timeout (read-only)."""
+        class SpyDriver:
+            captured = None
+            def evaluate(self, code, **kwargs):
+                self.__class__.captured = kwargs.get("mutating")
+                return {}
+        from perplexity_toolkit.console import _info
+        _info(SpyDriver())
+        assert SpyDriver.captured is False
+
 
 def _info_item(*, length=0, prose=0, stop=False, icon=IDLE_ICON,
                generating=False, studied=0):
@@ -990,7 +1002,7 @@ class ScriptedInfoDriver(ConsoleFakeDriver):
         self._script = [dict(x) for x in sequence]
         self._script_i = 0
 
-    def evaluate(self, code):
+    def evaluate(self, code, **kwargs):
         if "user-bubble" in code:
             item = self._script[min(self._script_i, len(self._script) - 1)]
             self._script_i += 1
@@ -1001,7 +1013,7 @@ class ScriptedInfoDriver(ConsoleFakeDriver):
 class EmptyProbeDriver(ConsoleFakeDriver):
     """The bridge answers every info probe with nothing."""
 
-    def evaluate(self, code):
+    def evaluate(self, code, **kwargs):
         if "user-bubble" in code:
             return {}
         return super().evaluate(code)
@@ -1119,7 +1131,7 @@ class ScrollScriptedDriver(ConsoleFakeDriver):
         self._scroll = [dict(x) for x in scroll_seq]
         self._scroll_i = 0
 
-    def evaluate(self, code):
+    def evaluate(self, code, **kwargs):
         if "scrollTop" in code:
             item = self._scroll[min(self._scroll_i, len(self._scroll) - 1)]
             self._scroll_i += 1
@@ -1172,7 +1184,7 @@ class TestScrollToBottom:
 
     def test_non_dict_probe_result_treated_as_empty(self):
         class IntDriver(ConsoleFakeDriver):
-            def evaluate(self, code):
+            def evaluate(self, code, **kwargs):
                 if "scrollTop" in code:
                     return 7
                 return super().evaluate(code)
@@ -1440,7 +1452,7 @@ class TestExtractPeekAgain:
                 super().__init__(**kw)
                 self.prose_fails = 1
 
-            def evaluate(self, code):
+            def evaluate(self, code, **kwargs):
                 if self.prose_fails > 0 and "cloneNode" in code:
                     self.prose_fails -= 1
                     return {"found": False}
@@ -1584,7 +1596,7 @@ class TestFailureLoggingAndReattach:
                 super().__init__(share_tab=True, **kw)
                 self.prose_fails = 2
 
-            def evaluate(self, code):
+            def evaluate(self, code, **kwargs):
                 if self.prose_fails > 0 and "cloneNode" in code:
                     self.prose_fails -= 1
                     return {"found": False}
