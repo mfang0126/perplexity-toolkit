@@ -399,7 +399,8 @@ def _pending_require(state: dict, *, stage: str) -> dict:
 
 def _log_run(op: str, *, ok: bool = True, gate: Optional[str] = None,
              url: Optional[str] = None, elapsed: Optional[float] = None,
-             truncation_risk: Optional[bool] = None) -> None:
+             truncation_risk: Optional[bool] = None,
+             error: Optional[str] = None) -> None:
     """Append one compact line to runs.jsonl (best-effort observability)."""
     try:
         path = console_home() / "runs.jsonl"
@@ -413,10 +414,35 @@ def _log_run(op: str, *, ok: bool = True, gate: Optional[str] = None,
             rec["elapsed_s"] = round(elapsed, 1)
         if truncation_risk is not None:
             rec["truncation_risk"] = bool(truncation_risk)
+        if error is not None:
+            rec["error"] = error
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
+
+
+# Codes that make a submit worth re-attaching once (T8): the staged page
+# moved away, or the WebBridge lost the tab. Everything else fails fast.
+_REATTACH_CODES = frozenset({"pending.page-moved", "attach.bad-response",
+                             "attach.disconnected", "attach.no-tab"})
+
+
+def _fail_log(op: str, exc: ConsoleError, state: Optional[dict], *,
+              elapsed_s: Optional[float] = None) -> None:
+    """Record a FAILED operation in runs.jsonl (T8): ok=False + error code.
+
+    Best-effort like ``_log_run`` (never raises, never re-raises ``exc``):
+    callers invoke it at the final re-raise exit so each failure is written
+    exactly once.
+    """
+    url = None
+    if isinstance(state, dict):
+        p = state.get("pending")
+        if isinstance(p, dict):
+            url = p.get("url")
+    _log_run(op, ok=False, gate=exc.gate or None, url=url,
+             error=exc.code, elapsed=elapsed_s)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1336,41 +1362,51 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
     drv = driver or _make_driver(cfg, state)
     started = time.monotonic()
 
-    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
-                         files=files, sleep=sleep)
-    gates = dict(staged["gates"])
-    pending = staged["pending"]
+    try:
+        staged = _stage_fill(drv, state, cfg, query, task=task,
+                             new_thread=new_thread, files=files, sleep=sleep)
+        gates = dict(staged["gates"])
+        pending = staged["pending"]
 
-    gates["submit"] = _submit_with_recovery(
-        drv, cfg, query, pending["base_bubbles"], files=files,
-        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
-        poll_interval=poll_interval, sleep=sleep, context_gates=gates, gates_out=gates)
+        gates["submit"] = _submit_with_recovery(
+            drv, cfg, query, pending["base_bubbles"], files=files,
+            submit_timeout=submit_timeout,
+            submit_recheck_timeout=submit_recheck_timeout,
+            poll_interval=poll_interval, sleep=sleep, context_gates=gates,
+            gates_out=gates)
 
-    gates["complete"] = _gate_complete(drv, pending["base_studied"],
-                                       base_prose_count=pending["base_prose_count"],
-                                       wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
+        gates["complete"] = _gate_complete(
+            drv, pending["base_studied"],
+            base_prose_count=pending["base_prose_count"],
+            wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
 
-    out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
-    judgment = console_judge.judge_extraction(query, out["answer"], flag=judge)
-    _log_run("ask", ok=True, url=out["url"],
-             elapsed=time.monotonic() - started)
+        out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending,
+                            gates_out=gates)
+        judgment = console_judge.judge_extraction(query, out["answer"],
+                                                  flag=judge)
+        _log_run("ask", ok=True, url=out["url"],
+                 elapsed=time.monotonic() - started)
 
-    return {
-        "ok": True,
-        "answer": out["answer"],
-        "judge": judgment,
-        "raw_answer": out["raw_answer"],
-        "sources": out["sources"],
-        "url": out["url"],
-        "title": out["title"],
-        "model": out["model"],
-        "attachments": pending["files"],
-        "task": task,
-        "session": state["session"],
-        "new_thread": new_thread,
-        "gates": gates,
-        "elapsed_s": round(time.monotonic() - started, 1),
-    }
+        return {
+            "ok": True,
+            "answer": out["answer"],
+            "judge": judgment,
+            "raw_answer": out["raw_answer"],
+            "sources": out["sources"],
+            "url": out["url"],
+            "title": out["title"],
+            "model": out["model"],
+            "attachments": pending["files"],
+            "task": task,
+            "session": state["session"],
+            "new_thread": new_thread,
+            "gates": gates,
+            "elapsed_s": round(time.monotonic() - started, 1),
+        }
+    except ConsoleError as exc:
+        # T8: the composite ask/send path records every failure too
+        _fail_log("ask", exc, state, elapsed_s=time.monotonic() - started)
+        raise
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1443,12 +1479,16 @@ def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
         return run()
     except ConsoleError as exc:
         if step not in ("fill", "wait", "extract"):
+            _fail_log(step, exc, state)  # T8: every final exit is recorded
             raise
         decision = console_judge.route_hint(exc.gate, exc.code, exc.message, flag=judge)
         route = decision.get("route") if decision.get("status") == "ok" else None
         if route not in ("retry-step", "reload-and-retry", "wait-longer") or (
                 route == "reload-and-retry" and not allow_reload):
-            raise  # escalate / unavailable / skipped / reload-forbidden -> original error stands
+            # escalate / unavailable / skipped / reload-forbidden: record the
+            # failure (T8), then let the original error stand
+            _fail_log(step, exc, state)
+            raise
         logger.warning("jev-directed recovery: %s (confidence %.2f) after %s",
                        route, decision.get("confidence") or 0.0, exc.code or exc.gate)
         if route == "reload-and-retry":
@@ -1461,6 +1501,7 @@ def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
             exc2.gates = {"jev_recovery": {"route": route, "applied": True,
                                            "attempts": 1, "first_error": exc.message},
                           **exc2.gates}
+            _fail_log(step, exc2, state)  # T8: bounded retry failed too
             raise
         if isinstance(result, dict):
             gates = result.setdefault("gates", {})
@@ -1495,25 +1536,84 @@ def console_submit(*, config: Optional[Config] = None, driver: Any = None,
                    sleep: Callable[[float], None] = time.sleep,
                    submit_timeout: float = SUBMIT_TIMEOUT,
                    submit_recheck_timeout: float = 6.0,
-                   poll_interval: float = POLL_INTERVAL) -> dict:
-    """Submit the staged turn (composer re-verified; bounded recovery)."""
+                   poll_interval: float = POLL_INTERVAL,
+                   allow_reattach: bool = True) -> dict:
+    """Submit the staged turn (composer re-verified; bounded recovery).
+
+    ``allow_reattach`` (T8): on ``pending.page-moved`` / bridge-lost
+    (``attach.*``-family) errors the tab is re-attached via ``console_open``
+    at MOST ONCE per call, then only the stage/verify readback is retried.
+    A submit action that may already have been emitted is never replayed
+    (double-send guard): for bridge-lost errors — whose send state is
+    unknown — ownership is re-verified after the re-attach first and, if the
+    turn already landed, the verify result is returned without re-sending.
+    ``allow_reattach=False`` restores the fail-fast behavior exactly.
+    Failures are recorded in runs.jsonl (``ok=False`` + error code).
+    """
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
-    pending = _pending_require(state, stage="submit")
-    gates: dict = {}
-    gates["submit"] = _submit_with_recovery(
-        drv, cfg, pending["query"], int(pending.get("base_bubbles") or 0),
-        files=list(pending.get("file_paths") or []),
-        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
-        poll_interval=poll_interval, sleep=sleep, context_gates={},
-        gates_out=gates, expect_url=pending.get("url"))
+    reattached = False
+    while True:
+        try:
+            pending = _pending_require(state, stage="submit")
+            gates: dict = {}
+            gates["submit"] = _submit_with_recovery(
+                drv, cfg, pending["query"], int(pending.get("base_bubbles") or 0),
+                files=list(pending.get("file_paths") or []),
+                submit_timeout=submit_timeout,
+                submit_recheck_timeout=submit_recheck_timeout,
+                poll_interval=poll_interval, sleep=sleep, context_gates={},
+                gates_out=gates, expect_url=pending.get("url"))
+            break
+        except ConsoleError as exc:
+            if not (allow_reattach and not reattached
+                    and (exc.code or "") in _REATTACH_CODES):
+                _fail_log("submit", exc, state)
+                raise
+            # bounded re-attach ladder: ONE console_open, then readback only
+            target = ((_pending(state) or {}).get("task")
+                      or state.get("active_task") or "default")
+            try:
+                console_open(target, config=cfg, driver=drv, sleep=sleep,
+                             new_thread=False)
+            except ConsoleError as oexc:
+                _fail_log("submit", oexc, state)
+                raise oexc from exc
+            reattached = True
+            state = load_state()
+            if exc.code != "pending.page-moved":
+                # bridge lost mid-flight: send state unknown — verify FIRST,
+                # never replay a submit that already landed
+                p2 = _pending(state) or {}
+                q = p2.get("query")
+                sent = bool(p2.get("submitted_at")) or (
+                    bool(q) and _wait_ownership(
+                        drv, q, int(p2.get("base_bubbles") or 0),
+                        timeout=submit_recheck_timeout, poll=poll_interval,
+                        sleep=sleep))
+                if sent:
+                    if not p2.get("submitted_at"):
+                        p2["submitted_at"] = _now_iso()
+                        p2["status"] = "submitted"
+                        state["pending"] = p2
+                        save_state(state)
+                    _log_run("submit", ok=True, url=p2.get("url"))
+                    return {"ok": True,
+                            "gates": {"submit": {"ok": True,
+                                                 "mechanism": "reattach-verify"}},
+                            "pending_status": "submitted", "reattached": True}
+            # not sent (page-moved fires pre-send): retry the readback once —
+            # the `reattached` guard bounds this to a single extra attempt
     pending["submitted_at"] = _now_iso()
     pending["status"] = "submitted"
     state["pending"] = pending
     save_state(state)
     _log_run("submit", ok=True, url=pending.get("url"))
-    return {"ok": True, "gates": gates, "pending_status": "submitted"}
+    out: dict = {"ok": True, "gates": gates, "pending_status": "submitted"}
+    if reattached:
+        out["reattached"] = True
+    return out
 
 
 def console_wait(*, config: Optional[Config] = None, driver: Any = None,
@@ -1585,9 +1685,11 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
                                  sleep=sleep, driver=drv,
                                  allow_reload=not (peek or again))
     if strict and out.get("truncation_risk"):
-        raise ConsoleError("extract", "答案疑似截断（strict 模式）",
+        err = ConsoleError("extract", "答案疑似截断（strict 模式）",
                            gates={"extract": {"truncation_risk": True}},
                            code="extract.truncation-risk")
+        _fail_log("extract", err, state)  # T8: strict gate failure is recorded
+        raise err
     return out
 
 
@@ -1602,20 +1704,27 @@ def console_send(query: str, *, task: str = "default", new_thread: bool = False,
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
-    staged = _stage_fill(drv, state, cfg, query, task=task, new_thread=new_thread,
-                         files=files, sleep=sleep)
-    gates = dict(staged["gates"])
-    pending = staged["pending"]
-    gates["submit"] = _submit_with_recovery(
-        drv, cfg, query, pending["base_bubbles"], files=files,
-        submit_timeout=submit_timeout, submit_recheck_timeout=submit_recheck_timeout,
-        poll_interval=poll_interval, sleep=sleep, context_gates=gates, gates_out=gates)
-    pending["submitted_at"] = _now_iso()
-    pending["status"] = "submitted"
-    state["pending"] = pending
-    save_state(state)
-    _log_run("send", ok=True, url=pending.get("url"))
-    return {"ok": True, "gates": gates, "pending": pending, "task": task}
+    try:
+        staged = _stage_fill(drv, state, cfg, query, task=task,
+                             new_thread=new_thread, files=files, sleep=sleep)
+        gates = dict(staged["gates"])
+        pending = staged["pending"]
+        gates["submit"] = _submit_with_recovery(
+            drv, cfg, query, pending["base_bubbles"], files=files,
+            submit_timeout=submit_timeout,
+            submit_recheck_timeout=submit_recheck_timeout,
+            poll_interval=poll_interval, sleep=sleep, context_gates=gates,
+            gates_out=gates)
+        pending["submitted_at"] = _now_iso()
+        pending["status"] = "submitted"
+        state["pending"] = pending
+        save_state(state)
+        _log_run("send", ok=True, url=pending.get("url"))
+        return {"ok": True, "gates": gates, "pending": pending, "task": task}
+    except ConsoleError as exc:
+        # T8: send failures always leave an ok=False + error-code record
+        _fail_log("send", exc, state)
+        raise
 
 
 def console_attach(files: list, *, config: Optional[Config] = None, driver: Any = None,

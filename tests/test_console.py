@@ -1511,3 +1511,145 @@ class TestCliExtractPeekAgain:
         assert rc == 0
         assert captured.get("again") is True
         assert "consumed: false" in out
+
+
+def _last_run_record(home):
+    """True-disk read of the LAST runs.jsonl line ({} when absent)."""
+    path = home / "runs.jsonl"
+    if not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    return json.loads(lines[-1]) if lines else {}
+
+
+class TestFailureLoggingAndReattach:
+    """T8: every failing op leaves `ok=False` + error code in runs.jsonl;
+    a page-moved / bridge-lost submit re-attaches ONCE and never re-sends."""
+
+    def test_wait_timeout_is_logged_with_error_code(self, tmp_console_home,
+                                                     monkeypatch):
+        from perplexity_toolkit import console_judge
+
+        # deterministic offline route: no retry, the original error stands
+        monkeypatch.setattr(
+            console_judge, "route_hint",
+            lambda gate, code, message, *, client=None, flag=None: {
+                "enabled": True, "status": "ok", "route": "escalate",
+                "confidence": 0.9})
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+
+        def timeout(*args, **kwargs):
+            raise ConsoleError("complete", "settle budget exhausted",
+                               code="complete.timeout")
+
+        monkeypatch.setattr(console, "_gate_complete", timeout)
+        with pytest.raises(ConsoleError) as exc:
+            console_wait(config=make_config(), driver=drv, sleep=NOOP)
+        assert exc.value.code == "complete.timeout"
+        rec = _last_run_record(tmp_console_home)
+        assert rec.get("ok") is False
+        assert rec.get("error") == "complete.timeout"
+        assert rec.get("op") == "wait"
+
+    def test_send_path_failure_is_logged_too(self, tmp_console_home,
+                                              monkeypatch):
+        from perplexity_toolkit import console_judge
+
+        # (a) console_submit failure leaves an ok=False + code record
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        drv.force_btn_disabled = True   # editor never commits → gate fails
+        with pytest.raises(ConsoleError) as exc:
+            console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                           submit_timeout=0.2, submit_recheck_timeout=0.05)
+        assert exc.value.code
+        rec = _last_run_record(tmp_console_home)
+        assert rec.get("ok") is False
+        assert rec.get("error") == exc.value.code
+        assert rec.get("op") == "submit"
+
+        # (b) the jev-recovery exc2 path (retried run failed again) too
+        monkeypatch.setattr(
+            console_judge, "route_hint",
+            lambda gate, code, message, *, client=None, flag=None: {
+                "enabled": True, "status": "ok", "route": "retry-step",
+                "confidence": 0.8})
+
+        class ProseFailsTwiceDriver(ConsoleFakeDriver):
+            """First TWO prose probes find nothing → run + jev retry both fail."""
+
+            def __init__(self, **kw):
+                super().__init__(share_tab=True, **kw)
+                self.prose_fails = 2
+
+            def evaluate(self, code):
+                if self.prose_fails > 0 and "cloneNode" in code:
+                    self.prose_fails -= 1
+                    return {"found": False}
+                return super().evaluate(code)
+
+        drv2 = ProseFailsTwiceDriver()
+        drv2.prose = ["答案 42。"]
+        with pytest.raises(ConsoleError) as exc2:
+            console_extract(config=make_config(), driver=drv2, sleep=NOOP,
+                            judge=True)
+        assert exc2.value.code == "extract.empty"
+        rec2 = _last_run_record(tmp_console_home)
+        assert rec2.get("ok") is False
+        assert rec2.get("error") == "extract.empty"
+        assert rec2.get("op") == "extract"
+
+    def test_page_moved_reattach_retries_verify_never_resubmit(self,
+                                                               monkeypatch):
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        staged_url = load_state()["pending"]["url"]
+        # the tab drifts away from the staged thread after fill
+        drv.url = "https://www.perplexity.ai/search/someone-elses-thread"
+        drv.tab_url = drv.url
+
+        opened = []
+
+        def fake_open(target, **kwargs):
+            opened.append(target)
+            drv.url = staged_url          # re-attach lands back on the thread
+            drv.tab_url = staged_url
+            return {"ok": True, "target": target}
+
+        monkeypatch.setattr(console, "console_open", fake_open)
+
+        gate_calls = []
+        real_gate_submit = console._gate_submit
+
+        def counting_gate(*args, **kwargs):
+            gate_calls.append(1)
+            return real_gate_submit(*args, **kwargs)
+
+        monkeypatch.setattr(console, "_gate_submit", counting_gate)
+
+        res = console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                             submit_timeout=0.4, submit_recheck_timeout=0.1)
+        assert res["ok"] is True
+        assert res["reattached"] is True
+        assert opened == ["default"]      # bounded: exactly one re-attach
+        assert len(gate_calls) == 1       # submit executor ran exactly once
+        assert len(drv.bubbles) == 1      # double-send detector: one turn only
+
+    def test_reattach_disabled_behaves_as_before(self, monkeypatch):
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        drv.url = "https://www.perplexity.ai/search/someone-elses-thread"
+        drv.tab_url = drv.url
+
+        opened = []
+        monkeypatch.setattr(
+            console, "console_open",
+            lambda target, **kw: opened.append(target) or {"ok": True})
+        with pytest.raises(ConsoleError) as exc:
+            console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                           allow_reattach=False)
+        assert exc.value.code == "pending.page-moved"
+        assert opened == []               # no re-attach attempted
+        assert drv.bubbles == []          # nothing was sent
