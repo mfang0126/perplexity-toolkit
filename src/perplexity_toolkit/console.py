@@ -1234,11 +1234,14 @@ def _truncation_risk_fields(text: str, *, still_generating: bool) -> dict:
 def _extract_step(drv: Any, state: dict, cfg: Config, *,
                   sleep: Callable[[float], None],
                   pending: Optional[dict] = None,
-                  gates_out: Optional[dict] = None) -> dict:
+                  gates_out: Optional[dict] = None,
+                  consume: bool = True) -> dict:
     """Expand, extract the turn-scoped answer + sources, update bookkeeping.
 
     With ``pending`` the thread record is updated and the staged turn is
     cleared (exactly once); without it this is a read-only ad-hoc extract.
+    peek/again (``consume=False``): strictly read-only — no disk write, the
+    staged turn is NOT consumed and thread turn counts are NOT incremented.
     """
     gates = gates_out if gates_out is not None else {}
 
@@ -1280,7 +1283,9 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
     # must never feed this signal. Missing info ⇒ busy=False (flag only).
     busy = bool(post.get("stop_button")) or (
         (post.get("action_icon") or "") not in ("", SUBMIT_ICON_IDLE))
-    if pending:
+    if pending and consume:
+        # consumption block: turn bookkeeping + staged-turn clear + persist.
+        # consume=False (peek/again) skips ALL of it — read-only, no disk write.
         task_name = pending.get("task") or "default"
         q = pending.get("query") or ""
         now = _now_iso()
@@ -1296,7 +1301,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
             state["threads"][task_name] = entry
         state["active_task"] = task_name
         state["pending"] = None  # the staged turn is consumed
-    save_state(state)
+        save_state(state)
 
     return {
         "ok": True,
@@ -1306,6 +1311,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
         "url": url,
         "title": post.get("title") or "",
         "model": post.get("model") or "",
+        "consumed": bool(pending and consume),
         **_truncation_risk_fields(prose["text"], still_generating=busy),
     }
 
@@ -1414,7 +1420,8 @@ def _reload_console_tab(cfg: Config, state: dict, *,
 def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
                            judge: Optional[bool], cfg: Config, state: dict,
                            sleep: Callable[[float], None],
-                           driver: Any = None) -> dict:
+                           driver: Any = None,
+                           allow_reload: bool = True) -> dict:
     """Run a step; on failure with judging on, let Jev pick ONE bounded remedy.
 
     Concept from browser-use/jev-ultrafast: Jev chooses among offered
@@ -1425,7 +1432,12 @@ def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
     - the remedy set is fixed {retry-step, reload-and-retry, wait-longer,
       escalate} and exactly ONE extra attempt is executed;
     - the retried run passes every original gate again; any non-ok decision
-      (escalate / unavailable / skipped) re-raises the original error.
+      (escalate / unavailable / skipped) re-raises the original error;
+    - ``allow_reload=False`` (peek/again: read-only paths) forbids the
+      reload-and-retry remedy — a reload would re-stream the page — so a
+      reload decision re-raises the original error instead of executing;
+      every other route follows the normal ladder (backward compatible:
+      default True keeps reload-and-retry available).
     """
     try:
         return run()
@@ -1434,8 +1446,9 @@ def _run_with_jev_recovery(step: str, run: Callable[[], dict], *,
             raise
         decision = console_judge.route_hint(exc.gate, exc.code, exc.message, flag=judge)
         route = decision.get("route") if decision.get("status") == "ok" else None
-        if route not in ("retry-step", "reload-and-retry", "wait-longer"):
-            raise  # escalate / unavailable / skipped -> original error stands
+        if route not in ("retry-step", "reload-and-retry", "wait-longer") or (
+                route == "reload-and-retry" and not allow_reload):
+            raise  # escalate / unavailable / skipped / reload-forbidden -> original error stands
         logger.warning("jev-directed recovery: %s (confidence %.2f) after %s",
                        route, decision.get("confidence") or 0.0, exc.code or exc.gate)
         if route == "reload-and-retry":
@@ -1532,20 +1545,34 @@ def console_wait(*, config: Optional[Config] = None, driver: Any = None,
 def console_extract(*, config: Optional[Config] = None, driver: Any = None,
                     judge: Optional[bool] = None,
                     strict: bool = False,
+                    peek: bool = False,
+                    again: bool = False,
                     sleep: Callable[[float], None] = time.sleep) -> dict:
     """Extract the newest answer (+sources); consumes the staged turn.
 
     ``strict`` turns the advisory truncation flag into a hard failure
     (``extract.truncation-risk``); by default a risky answer is only marked.
+
+    peek/again are read-only re-reads (mutually exclusive):
+    - ``peek=True``: reads the staged turn WITHOUT consuming it (no disk
+      write, no turn increment — the pending record survives);
+    - ``again=True``: re-reads without a staged turn at all (the task
+      falls back to ``state["active_task"]``).
+    Both disable the reload-and-retry remedy (``allow_reload=False``):
+    a reload would re-stream the page under a read-only call.
     """
+    if peek and again:
+        raise ConsoleError("extract", "--peek 与 --again 互斥（只读重读只能选其一）",
+                           code="extract.flag-conflict")
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
 
     def _once() -> dict:
-        pending = _pending(state) or None
+        pending = None if again else (_pending(state) or None)
         gates: dict = {}
-        out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending, gates_out=gates)
+        out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending,
+                            gates_out=gates, consume=not peek)
         out["gates"] = gates
         out["task"] = (pending or {}).get("task") or state.get("active_task")
         out["judge"] = console_judge.judge_extraction(
@@ -1555,7 +1582,8 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
         return out
 
     out = _run_with_jev_recovery("extract", _once, judge=judge, cfg=cfg, state=state,
-                                 sleep=sleep, driver=drv)
+                                 sleep=sleep, driver=drv,
+                                 allow_reload=not (peek or again))
     if strict and out.get("truncation_risk"):
         raise ConsoleError("extract", "答案疑似截断（strict 模式）",
                            gates={"extract": {"truncation_risk": True}},

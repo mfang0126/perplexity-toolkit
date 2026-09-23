@@ -263,12 +263,16 @@ def cmd_console(args) -> int:
             if scroll.get("settled") is False:
                 lines.append("⚠️ scroll unsettled（懒渲染可能未完成，"
                              "extract --peek 复核）")
+            if "consumed" in p:
+                lines.append(f"consumed: {str(bool(p['consumed'])).lower()}")
             if p.get("truncation_risk") is True:
                 lines.append("⚠️ 可能截断（尾部无终止符且仍在生成）")
             return lines
         ok = _console_run_step(console_extract, fmt,
                                kwargs={"judge": getattr(args, "judge", None),
-                                       "strict": getattr(args, "strict", False)},
+                                       "strict": getattr(args, "strict", False),
+                                       "peek": getattr(args, "peek", False),
+                                       "again": getattr(args, "again", False)},
                                text_lines=_t_extract)
         return 0 if ok else 1
 
@@ -556,6 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--strict", action="store_true",
                     help="Fail with extract.truncation-risk when the answer "
                          "looks truncated (advisory flag by default)")
+    pc.add_argument("--peek", action="store_true",
+                    help="Read the staged turn WITHOUT consuming it "
+                         "(read-only re-read; no disk write, no turn count)")
+    pc.add_argument("--again", action="store_true",
+                    help="Re-read the newest answer without a staged turn "
+                         "(read-only; mutually exclusive with --peek)")
     pc = csub.add_parser("send", help="Stage + submit in one call (fill + submit)")
     pc.add_argument("query")
     pc.add_argument("--task", default="default")

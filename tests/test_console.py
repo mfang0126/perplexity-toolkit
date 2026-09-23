@@ -1379,3 +1379,135 @@ class TestCliExtractWarnings:
         out = capsys.readouterr().out
         assert rc == 1
         assert "extract.truncation-risk" in out
+
+
+# ──────────────────────────────────────────────────────────────
+# T7: extract --peek/--again — read-only re-read (no consume, no reload)
+# ──────────────────────────────────────────────────────────────
+
+class TestExtractPeekAgain:
+    """`peek` re-reads the staged turn without consuming it; `again` re-reads
+    without a staged turn at all. Both forbid the reload-and-retry remedy
+    (a reload would re-stream the page under a read-only call)."""
+
+    def test_peek_reads_but_does_not_consume(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi", config=make_config(), driver=drv, sleep=NOOP)
+        console_submit(config=make_config(), driver=drv, sleep=NOOP)
+        state = load_state()
+        assert state["pending"] is not None
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z", "turns": 3,
+        }
+        save_state(state)
+        drv.prose = ["答案 42。"]
+        out = console._extract_step(drv, state, make_config(), sleep=NOOP,
+                                    pending=state["pending"], consume=False)
+        assert out["ok"] is True
+        assert out["answer"] == "答案 42。"
+        assert out["consumed"] is False
+        # disk-level: staged turn survives, turn count unchanged
+        st = load_state()
+        assert st["pending"] is not None
+        assert st["threads"]["default"]["turns"] == 3
+
+    def test_again_reads_without_pending(self):
+        assert load_state()["pending"] is None
+        drv = ConsoleFakeDriver(share_tab=True)
+        drv.prose = ["答案 42。"]
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP,
+                              again=True)
+        assert res["ok"] is True
+        assert res["answer"] == "答案 42。"
+        assert res["consumed"] is False
+        assert load_state()["pending"] is None
+
+    def test_peek_again_disable_reload(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+        monkeypatch.setattr(
+            console_judge, "route_hint",
+            lambda gate, code, message, *, client=None, flag=None: {
+                "enabled": True, "status": "ok", "route": "reload-and-retry",
+                "confidence": 0.8})
+        sentinel = []
+        monkeypatch.setattr(console, "_reload_console_tab",
+                            lambda *a, **k: sentinel.append(True))
+
+        class FlakyProseDriver(ConsoleFakeDriver):
+            """First prose probe finds nothing (recoverable extract.empty)."""
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.prose_fails = 1
+
+            def evaluate(self, code):
+                if self.prose_fails > 0 and "cloneNode" in code:
+                    self.prose_fails -= 1
+                    return {"found": False}
+                return super().evaluate(code)
+
+        # default path: the ladder is allowed to reload (sentinel touched)
+        drv = FlakyProseDriver(share_tab=True)
+        drv.prose = ["答案 42。"]
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP,
+                              judge=True)
+        assert res["ok"] is True
+        assert sentinel, "default recovery path should attempt reload"
+        assert res["gates"]["jev_recovery"]["route"] == "reload-and-retry"
+
+        # peek: reload forbidden — original error stands, sentinel untouched
+        sentinel.clear()
+        drv2 = FlakyProseDriver(share_tab=True)
+        drv2.prose = ["答案 42。"]
+        with pytest.raises(ConsoleError) as exc:
+            console_extract(config=make_config(), driver=drv2, sleep=NOOP,
+                            judge=True, peek=True)
+        assert exc.value.code == "extract.empty"
+        assert sentinel == []
+
+        # again: same restriction
+        sentinel.clear()
+        drv3 = FlakyProseDriver(share_tab=True)
+        drv3.prose = ["答案 42。"]
+        with pytest.raises(ConsoleError) as exc3:
+            console_extract(config=make_config(), driver=drv3, sleep=NOOP,
+                            judge=True, again=True)
+        assert exc3.value.code == "extract.empty"
+        assert sentinel == []
+
+    def test_peek_again_flags_conflict(self):
+        with pytest.raises(ConsoleError) as exc:
+            console_extract(config=make_config(), driver=ConsoleFakeDriver(),
+                            sleep=NOOP, peek=True, again=True)
+        assert exc.value.code == "extract.flag-conflict"
+
+
+class TestCliExtractPeekAgain:
+    """`--peek`/`--again` are forwarded and the consumed verdict prints."""
+
+    @staticmethod
+    def _run(monkeypatch, capsys, extra):
+        captured = {}
+
+        def fake(**kw):
+            captured.update(kw)
+            return {"ok": True, "answer": "答案 42。", "url": "u",
+                    "model": "m", "sources": [], "gates": {},
+                    "judge": {"enabled": False}, "consumed": False}
+
+        monkeypatch.setattr(console, "console_extract", fake)
+        args = build_parser().parse_args(["console", "extract", *extra])
+        rc = cmd_console(args)
+        return rc, capsys.readouterr().out, captured
+
+    def test_peek_flag_forwarded_and_shows_consumed(self, monkeypatch, capsys):
+        rc, out, captured = self._run(monkeypatch, capsys, ("--peek",))
+        assert rc == 0
+        assert captured.get("peek") is True
+        assert "consumed: false" in out
+
+    def test_again_flag_forwarded_and_not_consuming(self, monkeypatch, capsys):
+        rc, out, captured = self._run(monkeypatch, capsys, ("--again",))
+        assert rc == 0
+        assert captured.get("again") is True
+        assert "consumed: false" in out
