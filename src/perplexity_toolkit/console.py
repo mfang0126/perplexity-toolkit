@@ -234,6 +234,12 @@ _JS_MODEL_BTN = r"""(() => {
     x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)});
 })()"""
 
+_JS_VISIBILITY = r"""(() => {
+  return JSON.stringify({visible: document.visibilityState === 'visible',
+                         visibilityState: document.visibilityState,
+                         hidden: !!document.hidden});
+})()"""
+
 _JS_MODEL_MENU = r"""(() => {
   const menu = document.querySelector('[role=menu]');
   if (!menu) return JSON.stringify({open: false, rows: []});
@@ -313,6 +319,8 @@ def _default_state() -> dict:
         "active_task": None,
         "threads": {},
         "pending": None,
+        "open_url": None,
+        "open_url_at": None,
     }
 
 
@@ -325,7 +333,8 @@ def load_state() -> dict:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return state
     if isinstance(data, dict):
-        for key in ("version", "session", "group_title", "active_task", "pending"):
+        for key in ("version", "session", "group_title", "active_task", "pending",
+                    "open_url", "open_url_at"):
             if key in data:
                 state[key] = data[key]
         if isinstance(data.get("threads"), dict):
@@ -891,17 +900,46 @@ def _model_button(driver: Any) -> dict:
     return btn if isinstance(btn, dict) else {}
 
 
+def _tab_visible(driver: Any) -> Optional[bool]:
+    """document.visibilityState via WebBridge (read-only).
+
+    Trusted CDP clicks are SILENTLY DROPPED while the tab is hidden/occluded
+    (observed 2026-09-27 — the same rung works immediately once the tab is
+    visible). None means the probe could not be read (treat as visible).
+    """
+    info = _js(driver, _JS_VISIBILITY, {}, mutating=False)
+    if isinstance(info, dict) and "visible" in info:
+        return bool(info.get("visible"))
+    return None
+
+
 def _open_model_menu(driver: Any, *, sleep: Callable[[float], None],
                      attempts: int = 2) -> dict:
     """Open the model selector menu and return its rows (menu left OPEN).
 
     The menu is a Radix portal: synthetic .click() does nothing, a trusted
-    CDP mouse click works (verified live 2026-09-21).
+    CDP mouse click works (verified live 2026-09-21) — but only while the tab
+    is actually visible. A hidden tab drops the click without any error, so
+    run the visibility gate first: try `Page.bringToFront` through the
+    WebBridge CDP channel, and raise `model.tab-hidden` (instead of the
+    generic `model.menu-failed`) when the tab cannot be surfaced.
     """
     button = _model_button(driver)
     if not button.get("found"):
         raise ConsoleError("model", "model selector button not found in the composer",
                            code="model.no-button")
+    if _tab_visible(driver) is False:
+        try:
+            driver.cdp("Page.bringToFront")
+        except Exception:  # noqa: BLE001 — the visibility gate below decides
+            pass
+        sleep(0.6)
+        if _tab_visible(driver) is False:
+            raise ConsoleError(
+                "model",
+                ("the console tab is hidden/occluded — trusted clicks are silently "
+                 "dropped; bring the Chrome tab to the front and retry"),
+                evidence=_evidence(driver), code="model.tab-hidden")
     menu = _js(driver, _JS_MODEL_MENU, {})
     for _ in range(attempts):
         if isinstance(menu, dict) and menu.get("open"):
@@ -1070,9 +1108,22 @@ def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
 
 def _ensure_task_context(drv: Any, state: dict, *, task: str, new_thread: bool,
                          cfg: Config, sleep: Callable[[float], None]) -> dict:
-    """Attach to the task's thread (or home for a new thread) and verify."""
+    """Attach to the task's thread (or home for a new thread) and verify.
+
+    ``console open <url>`` binding: when set and the caller did not explicitly
+    ask for a new thread, the staged turn continues the bound thread — a
+    deliberate thread switch — instead of the task's previous thread or home.
+    """
     thread = state["threads"].get(task) or {}
-    target = BASE_URL if new_thread else (thread.get("url") or BASE_URL)
+    open_url = state.get("open_url") or ""
+    if new_thread:
+        state["open_url"] = None
+        state["open_url_at"] = None
+        target = BASE_URL
+    elif open_url and HREF_MATCH_SLACK in open_url:
+        target = open_url
+    else:
+        target = thread.get("url") or BASE_URL
     attach_res = attach(drv, state, target, cfg=cfg, sleep=sleep)
     pre = _info(drv)
     if new_thread and HREF_MATCH_SLACK in (pre.get("url") or ""):
@@ -1321,16 +1372,24 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
         now = _now_iso()
         if HREF_MATCH_SLACK in url:
             entry = dict(state["threads"].get(task_name) or {})
+            switched = bool(entry.get("url")) and not _url_matches(entry["url"], url)
             entry.update({"url": url, "last_used_at": now})
-            if pending.get("new_thread") or not entry.get("created_at") or "url" not in entry:
+            if (pending.get("new_thread") or switched
+                    or not entry.get("created_at") or "url" not in entry):
                 entry["created_at"] = now
                 entry["label"] = _normalize(q)[:80]
                 entry["turns"] = 1
             else:
                 entry["turns"] = int(entry.get("turns") or 0) + 1
+            if not entry.get("label"):
+                entry["label"] = _normalize(q)[:80]
             state["threads"][task_name] = entry
         state["active_task"] = task_name
         state["pending"] = None  # the staged turn is consumed
+        # The `console open <url>` binding is one-shot: it has served this turn
+        # (the thread is now registered above), so drop it.
+        state["open_url"] = None
+        state["open_url_at"] = None
         save_state(state)
 
     return {
@@ -1423,7 +1482,13 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
 def console_open(target: str, *, new_thread: bool = False,
                  config: Optional[Config] = None, driver: Any = None,
                  sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Attach the console tab to a task thread (by name) or a direct URL."""
+    """Attach the console tab to a task thread (by name) or a direct URL.
+
+    A direct URL is additionally **bound** to the next fill/ask/send: the next
+    staged turn continues that thread even if its task has an older thread of
+    its own (one-shot binding, consumed when the turn is extracted). Switching
+    by task name clears any leftover URL binding.
+    """
     cfg = config or get_config()
     state = load_state()
     drv = driver or _make_driver(cfg, state)
@@ -1438,12 +1503,17 @@ def console_open(target: str, *, new_thread: bool = False,
         if not _url_matches(info.get("url") or "", target):
             raise ConsoleError("attach", f"tab did not reach {target!r}",
                                evidence=_evidence(drv), code="attach.navigate")
+        state["open_url"] = info.get("url") or target
+        state["open_url_at"] = _now_iso()
+        save_state(state)
         _log_run("open", ok=True, url=info.get("url"))
         return {"ok": True, "url": info.get("url") or "", "target": target,
-                "new_thread": False}
+                "new_thread": False, "bound": state["open_url"]}
     ctx = _ensure_task_context(drv, state, task=target, new_thread=new_thread,
                                cfg=cfg, sleep=sleep)
     state["active_task"] = target
+    state["open_url"] = None
+    state["open_url_at"] = None
     save_state(state)
     _log_run("open", ok=True, url=ctx["pre"].get("url"))
     return {"ok": True, "url": ctx["pre"].get("url") or "", "target": target,
@@ -1682,8 +1752,14 @@ def console_extract(*, config: Optional[Config] = None, driver: Any = None,
                             gates_out=gates, consume=not peek)
         out["gates"] = gates
         out["task"] = (pending or {}).get("task") or state.get("active_task")
+        # --again has no staged turn: fall back to the thread's recorded query
+        # label so the judge is not starved of the question (bug 2026-09-27).
+        task_for_query = out["task"] or "default"
+        judge_query = ((pending or {}).get("query")
+                       or (state.get("threads", {}).get(task_for_query) or {}).get("label")
+                       or "")
         out["judge"] = console_judge.judge_extraction(
-            (pending or {}).get("query") or "", out.get("answer") or "", flag=judge)
+            judge_query, out.get("answer") or "", flag=judge)
         _log_run("extract", ok=True, url=out.get("url"),
                  truncation_risk=out.get("truncation_risk"))
         return out

@@ -3,7 +3,7 @@ name: perplexity-web-automation
 description: |
   Use when the user asks to search Perplexity through a real browser. Automate Perplexity via Kimi WebBridge, extract answers and sources, and preserve task-level session state.
 metadata:
-  version: "0.3.1"
+  version: "0.5.0"
   requires: ["kimi-webbridge", "webbridge-hygiene"]
 ---
 
@@ -37,8 +37,8 @@ stop with an unverified result and do not infer the model from answer style.
 
 - Kimi WebBridge daemon running (`~/.kimi-webbridge/bin/kimi-webbridge start`)
 - Perplexity Pro account logged in (uses user's existing session)
-- Choose one **task-specific** WebBridge session name, for example `hermes-bot-combination-research`; pass it on every command in the task.
-- One task = one WebBridge session = one tab group. A Perplexity thread is the website conversation and is not the same thing as either the WebBridge session or the Chrome extension connection.
+- Serial work uses the resident console session (`perplexity-console`); only a genuinely separate parallel/atomic task gets its own **task-specific** session name (example: `hermes-bot-combination-research`), passed on every command in that task.
+- Serial Perplexity operations run in the resident `perplexity-console` **purpose** session; mint a separate `task` session only when the console cannot serve (parallel lanes, atomic close). Session/group policy and the duplicate ladder live in `webbridge-hygiene` (see its `references/group-tab-policy.md`). A Perplexity thread is the website conversation and is not the same thing as either the WebBridge session or the Chrome extension connection.
 - Before navigating, call `list_tabs` in the chosen session. Do not interpret an empty tab list as a failure: `{success:true,tabs:[]}` means the bridge is healthy and the session has no tab yet.
 
 ## Core Workflow
@@ -62,9 +62,17 @@ A successful `navigate` returning a `tabId`, followed by `list_tabs` showing one
 
 ### 0a. Observed transients & fixes (from a live run, 2026-09-21)
 
-- **First evaluate after idle can 502**: right after an idle period, the first `evaluate` (including the live readback inside `console status`) may return `WebBridge HTTP 502 Bad Gateway` while the `live` fields show null. A single retry of the same command recovers — do NOT restart the daemon and do NOT close tabs. If it fails twice in a row, use the recovery cookbook: `console open <task>` to re-attach, then continue.
-- **Duplicate tabs in the resident group**: the `perplexity-console` group can show two tabs for the same thread URL (the ledger tracks only 1; the `attach` gate reporting `tab_count: 2` is tolerated and fill/submit/extract still work). Dedupe convention: **after the task completes** (never close a tab that is mid-use), prefer `find_tab <old-thread-url>` + `close_tab` to drop the stale tab; otherwise close one duplicate of the current thread. Then `list_tabs` to confirm exactly 1 tab remains, and record the collision + resolution in the closeout report.
-- **Optional hardening (not yet implemented)**: auto-retry one 502 at the evaluate layer; auto-dedupe tabs at attach; flag ledger(1) vs live(2+) tab-count drift as a duplicate collision.
+- **First evaluate after idle can 502**: right after an idle period, the first
+  `evaluate` may return a 502 or timeout. **Auto-retry (implemented 2026-09-23)**:
+  the WebBridge driver now retries `evaluate` once on timeout/502/connect for
+  read-only probes (marked `mutating=False` in the JS snippet dispatch); mutating
+  calls (submit clicks, file injects) never retry. If the retry also fails,
+  the error propagates to `_js` which falls back to its default value; the empty-probe
+  fail-fast gate (`bridge.probe-failed`) triggers after 5 consecutive empty probes,
+  surfacing the persistent failure as a rich ConsoleError with a
+  `WebBridgeError(.kind)` cause (timeout/http_502/connect/protocol).
+- **Duplicate tabs in the resident group**: the `perplexity-console` group can show two tabs for the same thread URL (the ledger tracks only 1; the `attach` gate reporting `tab_count: 2` is tolerated and fill/submit/extract still work). **Global rule: the `webbridge-hygiene` duplicate ladder governs (live `list_tabs` verify first, never trust the ledger alone); the console-specific convention below is the site-level fix for this observed incident.** Dedupe convention: **after the task completes** (never close a tab that is mid-use), prefer `find_tab <old-thread-url>` + `close_tab` to drop the stale tab; otherwise close one duplicate of the current thread. Then `list_tabs` to confirm exactly 1 tab remains, and record the collision + resolution in the closeout report.
+- **Optional hardening (implemented 2026-09-23)**: auto-retry one 502 at the evaluate layer (read-only probes only); auto-dedupe tabs at attach; flag ledger(1) vs live(2+) tab-count drift as a duplicate collision.
 
 ### 1. Search (Proven 2026-08-29; connection smoke-tested 2026-09-05)
 
@@ -184,16 +192,18 @@ curl -s -X POST http://127.0.0.1:10086/command \
 For a fixed group+tab workflow, prefer the toolkit's resident console over hand-driving the raw steps:
 
 ```bash
-perplexity console ask "query" [--task NAME] [--new-thread] [-f json]   # one task = one thread
+perplexity console ask "query" [--task NAME] [--new-thread] [-f json] \
+    [--model NAME] [--wait SEC] [--file PATH] [--judge/--no-judge]   # one task = one thread
 perplexity console status                                              # state + live readback
 perplexity console threads                                             # recorded task threads
 perplexity console selfcheck                                           # canned full-gate run
+perplexity console extract [--peek] [--again] [--strict]               # re-read without consuming / strict
 ```
 
 Granular steps (intent composition — added 2026-09-21). The composite `ask` and the step commands share ONE implementation per step; each step is also callable alone and composes through a staged-turn ledger (`state.json → pending`):
 
 ```bash
-perplexity console open <task|url> [--new-thread]                # re-attach / switch threads
+perplexity console open <task|url> [--new-thread]                # re-attach / switch threads; `open <url>` binds the NEXT fill/ask to that thread (one-shot, consumed at extract — it continues the opened page instead of starting a new thread)
 perplexity console fill "q" [--task T] [--new-thread] [--file F] # stage: attach + fill + verify (no send)
 perplexity console submit                                        # submit the staged turn (verified, self-healing)
 perplexity console wait [--wait N]                               # wait for the staged answer to settle
@@ -203,10 +213,24 @@ perplexity console attach --file F | files | detach NAME         # attachment ma
 ```
 
 Recovery cookbook by error code (all commands print `error_code` in JSON):
-- `pending.missing` → nothing staged: run `fill` first. `pending.stale` (>30 min) → re-`fill`. `pending.page-moved` → tab wandered: `console open <task>` then re-`fill`. `pending.not-submitted` → `wait` needs `submit` first.
+- `pending.missing` → nothing staged: run `fill` first. `pending.stale` (>30 min) → re-`fill`. `pending.page-moved` → tab wandered: `console open <task>` then re-`fill`; page-moved now auto-reattaches once per step (but NEVER replays submit — checked at the step level). `pending.not-submitted` → `wait` needs `submit` first.
 - `fill.not-committed` → editor desynced; the step already tried one reload — re-run `fill` once, then read the evidence screenshot.
 - `submit.no-turn` → check the error's last-bubble hint; if a mis-sent turn exists, `console open` (reload) then re-`fill`/`submit`.
 - `complete.timeout` → answer didn't settle in budget: `wait --wait <bigger>` (deep answers run minutes) or `extract` what's there.
+- `bridge.probe-failed` → WebBridge gave 5 consecutive empty probes (e.g. 502 outage): retry the whole step.
+- `model.tab-hidden` → the console tab is hidden/occluded and trusted clicks would be silently dropped; bring the Chrome tab to the front and retry (`Page.bringToFront` was already attempted). `model.menu-failed` → the menu portal did not open even on a visible tab — retry once, then inspect the model button readback.
+- `extract.truncation-risk` → strict mode: the answer's tail has no sentence terminator
+  and the action icon suggests the page is still generating (not idle / morph to stop).
+  Extract succeeded but the truncated content should not be trusted — re-run with a
+  larger wait budget or wait then retry `extract` without `--strict`.
+
+`ask --model "Grok 4.6"` calls `console_set_model` before the fill, so you switch models
+and ask in one command. Available model names are listed by `perplexity console models`.
+
+`extract --peek` returns the same staged answer again without consuming the staged turn
+(no disk write, no turn increment); `--again` re-reads a consumed turn. Both disable
+page reload (safe for inspection during an active stream). `--strict` fails with
+`extract.truncation-risk` when the tail is mid-stream.
 - Default practice: ordinary turn → `ask`; anything unusual (partial flows, single-step retries, staged attachments, inspection between steps) → compose the granular steps.
 
 Optional Jev judge (added 2026-09-21; off by default):
@@ -219,19 +243,21 @@ Optional Jev judge (added 2026-09-21; off by default):
 
 Conventions: WebBridge session `perplexity-console`, group «Perplexity 控制台», exactly one tab. Durable state lives in `~/.perplexity-console/state.json` (session, group, per-task thread URL) because session→tab mappings are daemon-memory only and die on daemon restart — the console attach-or-recreates by reopening the saved thread URL. Every step carries a readback gate; failures raise with a screenshot under `~/.perplexity-console/evidence/`.
 
-Live-verified UI behaviors (2026-09; bake these into any direct-browser flow):
+Live-verified UI behaviors (2026-09-23; bake these into any direct-browser flow):
 
 - The composer is a controlled React editor. `fill` (clear-and-insert) is its ONLY reliable mutation path; CDP key events, execCommand and DOM/range edits get reverted by re-render, and empty/whitespace fill values are silent no-ops.
 - `fill` can also silently no-op on a fresh/unfocused editor while returning `success: true` — always read the composer back.
 - The submit button is `button[aria-label="提交"]`; its `disabled` flag mirrors the editor's internal state (disabled = state empty even if the DOM shows text). Verify `enabled` before clicking; a DOM/state desync (DOM shows text, button disabled) is healed by one page reload.
+- The action button **morphs icon** during generation: idle arrow-up (`#pplx-icon-arrow-up`) → stop icon during generation. The `_JS_INFO` probe captures `action_icon` (the `svg use href`). Busy detection: `action_icon != SUBMIT_ICON_IDLE`. The completion gate (v2.2, 2026-09-23) settles on **new answer seen** (proseCount > base_prose) ∧ length stable ≥2 ∧ icon idle ∧ no visible stop control — never on length alone (original bug: `stable >= 1` early-exit at 175s). The `studied` pill count is an **advisory** signal for Pro-Search turns only (answers without research get no pill). The `generating` regex constant-true noise (model badge 「正在思考」is a reasoning-mode label, not a live status) — never rely on it.
 - A late async draft-restore can merge old draft text into the composer AFTER a successful fill; the submission then carries draft+query (seen live). Re-verify composer equality immediately before submitting; repair by re-filling (fill replaces).
 - Per-turn scoping (never use `main.innerText` in a thread): user turns = `[class*="user-bubble"]` filtered `:not(.opacity-0)` (text = query + "\nHH:MM"); completion marker = one `已研究` pill per answered turn (count increments); the answer body = the LAST `main div.prose` (one per turn). The expand control in the new UI is a button labeled 「展开」 (the legacy 「查看更多」 did not appear in live mapping).
 
 Model selector & attachments (added 2026-09-21):
 
 - `perplexity console models` lists the selector menu (name/badges/checked; submenu entries like "GPT-5.6 Sol | Max" are flagged and not programmatic-selectable yet); `perplexity console model "<name>"` switches with a verified readback of the button's aria-label. The menu is a Radix portal: open and select ONLY with trusted CDP mouse clicks at element coordinates (synthetic clicks do nothing); close leftovers with Escape via CDP.
+- If the trusted click never lands (the menu probe stays closed with no pointer error), the tab is **hidden/occluded** (Chrome window not front / tab in background). **Corrected 2026-09-27**: trusted CDP clicks (`Input.dispatchMouseEvent`) are *silently dropped* while the tab is hidden — that rung does NOT survive occlusion (the earlier claim here was wrong; verified both ways live). The model-menu flow now runs a visibility gate first: `document.visibilityState` probe → `cdp Page.bringToFront` through the WebBridge channel → re-probe → raise `model.tab-hidden` if still hidden (bring the Chrome tab to the front, then retry). Product paths use the WebBridge/CDP channel only; `osascript`/AppleScript window driving is a development-debug tool, never a product rung. Synthetic `.click()` never works on this Radix portal regardless of visibility.
 - `ask --file PATH` (repeatable) attaches local files by building them in-page (base64 → Uint8Array → File → DataTransfer → input change event). This deliberately bypasses the WebBridge `upload` action, which requires Chrome's per-extension "Allow access to file URLs" (off by default, not toggleable by the extension; CDP `DOM.setFileInputFiles` is also blocked with "Not allowed"). Keep injection for files ≤8MB; for larger files point the user to the chrome://extensions toggle. Attachment chips verify via `aria-label="移除 <name>"`; wait ≥2s after chips appear before touching the composer.
-- Send hardening: an attachment chip keeps the submit button enabled even while the TEXT state lags — observed live as a FILE-ONLY submission. The pipeline now re-fills right before submit (freshness pass), re-verifies user-turn ownership afterwards, and recovers from a misfire with one reload + file re-inject + bounded retry (guarded by a delayed-ownership recheck so a slow-but-correct turn is never sent twice). The completion gate requires the turn-scoped prose count to GROW past the pre-submit baseline before stability counts — "the last answer hasn't changed" alone is not completion (a slow file-bearing answer once let that pass).
+- Send hardening: an attachment chip keeps the submit button enabled even while the TEXT state lags — observed live as a FILE-ONLY submission. The pipeline now re-fills right before submit (freshness pass), re-verifies user-turn ownership afterwards, and recovers from a misfire with one reload + file re-inject + bounded retry (guarded by a delayed-ownership recheck so a slow-but-correct turn is never sent twice). The completion gate requires a new answer to appear (proseCount > base_prose) AND the action icon idle (arrow-up, not morphed to stop) AND length stable ≥2 — never settles on length alone (the original bug: stable ≥ 1 early-exited at 175s).
 
 ## Key DOM Patterns
 
@@ -277,8 +303,8 @@ The CDP `Input.insertText` fallback (used when `fill` fails) applies to the **in
 
 ## Session Management
 
-- Use one task-specific session name for all Perplexity operations, even across follow-ups and source pages.
-- Reuse the current tab for a related follow-up; use `newTab:true` only when pages genuinely need to coexist.
-- Do not close the session automatically. Per `kimi-webbridge`, `close_session` is user-initiated only (for example, the user explicitly asks to close or clear the tabs).
+- Session/group policy lives in `webbridge-hygiene` (session classes + duplicate ladder); this section adds only Perplexity-specific practice. Serial Perplexity operations — follow-ups and source pages included — run in the `perplexity-console` purpose session; mint a task session only for parallel lanes or atomic close.
+- Reuse the current tab for a related follow-up; use `newTab:true` only when pages genuinely need to coexist (or to attach-or-recreate a lost keeper).
+- Do not close the session automatically. Per `kimi-webbridge`, `close_session` is user-initiated only (for example, the user explicitly asks to close or clear the tabs); never `close_session` the purpose console as cleanup — use `close_tab`.
 - If the extension says it is already linked, inspect `list_tabs` and continue with the existing daemon/session instead of creating a new thread/session.
-- Tabs accumulate in the session's group only when deliberately opened with `newTab:true`; keep the group small and readable.
+- Tabs accumulate in the session's group only when deliberately opened with `newTab:true`; keep the group within the hygiene purpose quota (target 1–3, ceiling 5) and readable.

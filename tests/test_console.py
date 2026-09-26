@@ -34,6 +34,7 @@ from perplexity_toolkit.console import (
     console_extract,
     console_fill,
     console_models,
+    console_open,
     console_selfcheck,
     console_send,
     console_set_model,
@@ -66,7 +67,8 @@ class ConsoleFakeDriver(BrowserDriver):
                  fill_appends=False, race_draft_after=None,
                  race_draft_text="旧草稿", force_btn_disabled=False,
                  btn_missing_first_click=0, desync_until_reload=False,
-                 desync_recover_after=1, busy=False):
+                 desync_recover_after=1, busy=False,
+                 tab_visible=True, bring_to_front_works=True):
         self.url = url
         self.answer = answer
         self.share_tab = share_tab
@@ -114,6 +116,8 @@ class ConsoleFakeDriver(BrowserDriver):
         self.pollute_first_fill = False
         self._polluted_once = False
         self.busy = busy   # still-generating page: busy stop + non-idle icon
+        self.tab_visible = tab_visible  # hidden tabs silently drop trusted clicks
+        self.bring_to_front_works = bring_to_front_works
 
     def _btn_state(self):
         """The submit button mirrors the editor's internal state."""
@@ -195,10 +199,17 @@ class ConsoleFakeDriver(BrowserDriver):
                     self.model_menu_open = False
         elif method == "Input.dispatchKeyEvent" and params and params.get("key") == "Escape":
             self.model_menu_open = False
+        elif method == "Page.bringToFront":
+            if self.bring_to_front_works:
+                self.tab_visible = True
         return {"ok": True}
 
     def evaluate(self, code, **kwargs):
         self.calls.append(("evaluate", code[:60]))
+        if "visibilityState" in code:
+            return {"visible": self.tab_visible,
+                    "visibilityState": "visible" if self.tab_visible else "hidden",
+                    "hidden": not self.tab_visible}
         if "cloneNode" in code:
             text = self.prose[-1] if self.prose else ""
             return {"found": bool(self.prose), "text": text, "raw": text}
@@ -822,6 +833,127 @@ class TestJudgeIntegration:
         res = console_extract(config=make_config(), driver=drv, sleep=NOOP, judge=True)
         assert seen["query"] == "文件里的数字"
         assert res["judge"]["status"] == "ok"
+
+    def test_extract_judge_again_falls_back_to_thread_label(self, monkeypatch):
+        from perplexity_toolkit import console_judge
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "label": "文件里的数字",
+            "turns": 1,
+        }
+        save_state(state)
+        seen = {}
+
+        def fake_judge(query, answer, *, client=None, flag=None):
+            seen["query"] = query
+            return {"enabled": True, "status": "ok"}
+
+        monkeypatch.setattr(console_judge, "judge_extraction", fake_judge)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        drv.prose = ["答案 42。"]
+        res = console_extract(again=True, config=make_config(), driver=drv,
+                              sleep=NOOP, judge=True)
+        assert seen["query"] == "文件里的数字"  # not starved to ""
+        assert res["judge"]["status"] == "ok"
+
+
+class TestOpenUrlBinding:
+    """`console open <url>` binds the next staged turn to that thread
+    (observed drift 2026-09-27: fill silently started a NEW thread instead)."""
+
+    def _seed_default_thread(self):
+        state = load_state()
+        state["threads"]["default"] = {
+            "url": "https://www.perplexity.ai/search/fake-thread-1",
+            "created_at": "2026-09-21T00:00:00Z",
+            "label": "旧问题",
+            "turns": 2,
+        }
+        save_state(state)
+
+    def test_open_url_binds_next_fill(self):
+        self._seed_default_thread()
+        target = "https://www.perplexity.ai/search/fake-thread-2"
+        drv = ConsoleFakeDriver(share_tab=True, url=target)
+        res = console_open(target, config=make_config(), driver=drv, sleep=NOOP)
+        assert res["bound"] == target
+        assert load_state()["open_url"] == target
+        drv2 = ConsoleFakeDriver(share_tab=True, url=target)
+        res_fill = console_fill("新问题", config=make_config(), driver=drv2, sleep=NOOP)
+        # the staged turn continues the BOUND thread, not threads["default"]
+        assert res_fill["pending"]["url"] == target
+        # the binding survives until the turn is consumed
+        assert load_state()["open_url"] == target
+
+    def test_extract_consumes_binding_and_switches_thread(self):
+        self._seed_default_thread()
+        state = load_state()
+        state["open_url"] = "https://www.perplexity.ai/search/fake-thread-2"
+        state["pending"] = {
+            "task": "default", "query": "新问题", "new_thread": False,
+            "files": [], "file_paths": [],
+            "url": "https://www.perplexity.ai/search/fake-thread-2",
+            "base_bubbles": 0, "base_studied": 0, "base_prose_count": 0,
+            "filled_at": _now_iso(), "submitted_at": _now_iso(),
+            "status": "completed",
+        }
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-2")
+        drv.prose = ["答案 42。"]
+        res = console_extract(config=make_config(), driver=drv, sleep=NOOP)
+        entry = load_state()["threads"]["default"]
+        assert entry["url"] == "https://www.perplexity.ai/search/fake-thread-2"
+        assert entry["label"] == "新问题"  # thread switch resets the accounting
+        assert entry["turns"] == 1
+        assert load_state()["open_url"] is None  # one-shot binding consumed
+        assert res["url"] == "https://www.perplexity.ai/search/fake-thread-2"
+
+    def test_new_thread_clears_binding(self):
+        self._seed_default_thread()
+        state = load_state()
+        state["open_url"] = "https://www.perplexity.ai/search/fake-thread-2"
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True, url=BASE_URL)
+        res = console_fill("全新问题", new_thread=True, config=make_config(),
+                           driver=drv, sleep=NOOP)
+        assert load_state()["open_url"] is None
+        assert res["pending"]["new_thread"] is True
+
+    def test_task_open_clears_binding(self):
+        self._seed_default_thread()
+        state = load_state()
+        state["open_url"] = "https://www.perplexity.ai/search/fake-thread-2"
+        save_state(state)
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1")
+        console_open("default", config=make_config(), driver=drv, sleep=NOOP)
+        assert load_state()["open_url"] is None
+
+
+class TestModelMenuVisibility:
+    """Trusted CDP clicks are silently dropped while the tab is hidden
+    (observed live 2026-09-27) — the menu flow must gate on visibility."""
+
+    def test_hidden_tab_raises_tab_hidden(self):
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1",
+                                tab_visible=False, bring_to_front_works=False)
+        with pytest.raises(ConsoleError) as ei:
+            console_models(config=make_config(), driver=drv, sleep=NOOP)
+        assert ei.value.code == "model.tab-hidden"
+        assert ("cdp", "Page.bringToFront", None) in drv.calls
+
+    def test_bring_to_front_recovers(self):
+        drv = ConsoleFakeDriver(share_tab=True,
+                                url="https://www.perplexity.ai/search/fake-thread-1",
+                                tab_visible=False, bring_to_front_works=True)
+        res = console_models(config=make_config(), driver=drv, sleep=NOOP)
+        assert res["ok"] and res["models"]
+        assert ("cdp", "Page.bringToFront", None) in drv.calls
 
 
 class TestJevDirectedRecovery:
