@@ -224,6 +224,83 @@ Recovery cookbook by error code (all commands print `error_code` in JSON):
   and the action icon suggests the page is still generating (not idle / morph to stop).
   Extract succeeded but the truncated content should not be trusted — re-run with a
   larger wait budget or wait then retry `extract` without `--strict`.
+- `probe.fallback-exhausted` → the primary probe AND the element-table fallback rung
+  both failed (fail-closed, never a half result). See the fallback ladder below for
+  the per-rung meaning and the handling recipe.
+
+### Element-table fallback ladder (probe → element-table rung → `probe.fallback-exhausted`)
+
+Two hard single points get a second rung (added 2026-09-28): the answer body
+(`main div.prose`) and submit ownership (the `user-bubble` completion anchor). The
+ladder is always `primary probe → element-table rung → probe.fallback-exhausted`,
+under fixed rules (external review D1=A / D2=A / D3=B + WARN):
+
+- **D1=A** — rung targets are picked by a PURE deterministic heuristic (no LLM).
+  The heuristic only proposes **candidates**; a candidate is adopted only after a
+  semantic readback (and, where the rung acts, an effect verification).
+- **D2=A** — when the fallback also fails, the unified code is
+  `probe.fallback-exhausted`, fail-closed — the console never returns half results.
+  If the rung's own probes are dead there is nothing to fall back onto and the
+  historical fail-closed code stands (`extract.empty` / `submit.no-turn`).
+- **D3=B** — every fallback trigger appends a `runs.jsonl` event
+  (`op=fallback`, rung name, ok/status, hit-element snapshot summary). The summary
+  is `role/label/text-head`, sanitized (URL query strings stripped, suspected
+  tokens masked) and ≤80 chars. `console drift` shows a `fallbacks:` section with
+  the cumulative count per rung and the recent summaries.
+
+The three rungs and their semantics:
+
+1. **`prose-table`** (answer text, fires when `div.prose` is missing/empty):
+   content-block candidates from the element table + content containers, scored
+   deterministically as *text length × container semantic weight*
+   (main 1.4 / article 1.3 / section 1.1 / div 1.0) with navigation chrome
+   (nav/aside/footer/header/sidebar by role/aria/class/position) excluded. The
+   best candidate is adopted only if a second readback still shows a non-empty
+   block of ≥200 chars containing sentence punctuation. Success output carries
+   `fallback_used: "prose-table"` + `fallback_summary`. No adoptable candidate →
+   `probe.fallback-exhausted`. The same rung covers the prose-COUNT path
+   (`_JS_INFO` `proseCount`/`lastProseLen`): when `div.prose` is gone the
+   completion/scroll waits measure the largest content block instead, with the
+   first prose-dead sample as the staleness baseline (a new answer must GROW
+   past it — a stale block can never satisfy the gate).
+2. **`ownership-table`** (submit ownership, fires only when the user-bubble
+   anchor is dead — no new turn marker at all): ownership is claimed ONLY with
+   **both** an independent identity binding (this turn's query text present in
+   the thread/page, normalized-whitespace containment) **and** an effect signal
+   (the answer area starts growing or the completion-marker count increases).
+   **WARN red line (highest constraint): composer state, URL changes and count
+   changes alone can NEVER prove ownership** — the composer subtree is excluded
+   from the binding search because it still holds the query without a submit.
+   Missing either half → `probe.fallback-exhausted`, and the send path does NOT
+   reload/retry on that code (never re-send on missing identity evidence).
+   Success output carries `fallback_used: "ownership-table"` + `fallback_summary`.
+3. **`expand-table`** (expand control, fires when the exact-label probe fully
+   missed): near-match buttons from the element table (edit distance ≤2 to
+   「展开/查看更多/Expand/Show more」 or containing the 「展开/更多/Show more/Expand」
+   family). Non-button roles, disabled controls and anything carrying ？/? are
+   excluded — follow-up question buttons are NEVER clicked. Each candidate must
+   survive a readback AND its trusted-CDP click must grow the answer block
+   (effect verification); only then is it success (`fallback_used:
+   "expand-table"`). Candidates exist but no click grows the answer →
+   `probe.fallback-exhausted`. No expand-like candidate at all = nothing to
+   expand (plain `none`, not a failure).
+
+Every rung carries the no-progress circuit breaker semantics: same-turn repeats
+with zero substantive progress trip `act.no-progress` instead of spinning.
+Precedence: a frozen page (byte-identical samples ×3) → `act.no-progress`; a page
+that moves but can never prove the claim → `probe.fallback-exhausted`.
+
+Handling recipes:
+- `act.no-progress` → nothing on the page is moving at all (breaker, fail-fast).
+  Check the tab (hidden tab / dead composer / extension down), then re-fire ONCE.
+  Never blind-retry a send on this code: verify ownership first.
+- `probe.fallback-exhausted` → evidence-level failure, NOT a transient: the
+  console could not PROVE its claim (no adoptable answer block / no expand
+  verification / missing query binding or effect signal). Do NOT auto-retry the
+  send. Read `gates.*.fallback*` (`bound`, `effect`, `candidates`, `summary`)
+  and the `runs.jsonl` `op=fallback` events to see what was missing, then either
+  re-run `fill`/`submit` after inspecting the tab, or extract with `--peek` to
+  review the page state.
 
 `ask --model "Grok 4.6"` calls `console_set_model` before the fill, so you switch models
 and ask in one command. Available model names are listed by `perplexity console models`.

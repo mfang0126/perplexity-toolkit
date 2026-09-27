@@ -299,6 +299,169 @@ _JS_INJECT_FILE = r"""(() => {
 
 
 # ──────────────────────────────────────────────────────────────
+# Element-table fallback probes (second rung of the fail-closed ladder)
+#
+# The console has two "whole-run stops" (audit 2026-09-28): the answer text
+# is `main div.prose` (_JS_INFO/_JS_PROSE/_JS_SCROLL) and submit ownership
+# is the `[class*="user-bubble"]` completion anchor (_wait_ownership). These
+# probes give both a SECOND rung — `probe → element-table rung →
+# probe.fallback-exhausted` — under the external review's ruling:
+#
+#   D1=A  the fallback target choice is a PURE deterministic heuristic (no
+#         LLM); it only ever produces CANDIDATES, and a candidate is adopted
+#         only after a semantic readback (and, for actions, an effect check);
+#   D2=A  when the fallback also fails: unified error code
+#         `probe.fallback-exhausted`, fail-closed, never a half result;
+#   D3=B  every fallback trigger appends a runs.jsonl event carrying a
+#         sanitized hit-element snapshot summary (role/label/text head with
+#         URL query strings and suspected tokens stripped, ≤80 chars); the
+#         drift report shows the cumulative count and recent summaries.
+#
+# WARN (highest constraint): composer state, URL changes and count changes
+# can NEVER prove submit ownership on their own. Ownership is only claimed
+# with an independent identity binding (this turn's query text present in
+# the page/thread — never in the composer) PLUS an effect signal (the
+# answer area starts growing or the completion-marker count increases).
+#
+# All probes below are locale-neutral and read-only (the expand rung's
+# click goes through trusted CDP mouse events, not through these probes).
+# Each carries a /*PPLX_*_PROBE*/ marker so test doubles can dispatch on
+# an unambiguous signature.
+# ──────────────────────────────────────────────────────────────
+
+# Minimal element table: atomic read of VISIBLE controls only — index,
+# role, aria-label, innerText ≤120 chars, rect, disabled. Read-only: no
+# click, no input, no scroll (relied on by tests and the drift selfcheck).
+_JS_TABLE = r"""/*PPLX_TABLE_PROBE*/(() => {
+  const vis = (el) => { try { return el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null; } catch (e) { return true; } };
+  const nodes = document.querySelectorAll('button, a, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="menuitemradio"], [role="option"], input, select, textarea, summary, [contenteditable]');
+  const out = [];
+  let i = 0;
+  for (const el of nodes) {
+    if (el.tagName.toLowerCase() === 'a' && !el.hasAttribute('href')) continue;
+    if (!vis(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    out.push({i: i++, tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || '',
+      label: el.getAttribute('aria-label') || '',
+      text: String(el.innerText || el.value || '').trim().slice(0, 120),
+      rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)},
+      disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true')});
+    if (out.length >= 200) break;
+  }
+  return JSON.stringify({items: out, count: out.length});
+})()"""
+
+# Content-block candidates for the prose rung: visible block containers with
+# their text, container semantics and a chrome hint (nav/aside/footer/header
+# /sidebar-ish) computed from tag/role/class ancestry so the deterministic
+# scorer in Python can exclude navigation chrome by role/aria/position.
+_JS_BLOCKS = r"""/*PPLX_BLOCKS_PROBE*/(() => {
+  const vis = (el) => { try { return el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null; } catch (e) { return true; } };
+  const hintOf = (el) => {
+    for (let n = el; n && n !== document.body; n = n.parentElement) {
+      const tag = n.tagName ? n.tagName.toLowerCase() : '';
+      const role = n.getAttribute ? (n.getAttribute('role') || '') : '';
+      const cls = String((typeof n.className === 'string' ? n.className : '') || '');
+      if (tag === 'nav' || role === 'navigation') return 'nav';
+      if (tag === 'aside' || role === 'complementary') return 'aside';
+      if (tag === 'footer' || role === 'contentinfo') return 'footer';
+      if (tag === 'header' || role === 'banner') return 'header';
+      if (/sidebar|side-bar|rail|footer|nav-|menu-/.test(cls)) return 'chrome';
+    }
+    return '';
+  };
+  const out = [];
+  let i = 0;
+  for (const el of document.querySelectorAll('main, article, [role="main"], section, div')) {
+    if (!vis(el)) continue;
+    const t = String(el.innerText || '').trim();
+    if (t.length < 80) continue;
+    const r = el.getBoundingClientRect();
+    out.push({i: i++, tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || '',
+      label: el.getAttribute('aria-label') || '',
+      cls: String(typeof el.className === 'string' ? el.className : '').slice(0, 80),
+      hint: hintOf(el), len: t.length, text: t.slice(0, 4000),
+      rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}});
+    if (out.length >= 40) break;
+  }
+  return JSON.stringify({blocks: out, count: out.length});
+})()"""
+
+# Identity binding for the ownership rung: does THIS turn's query text (the
+# exact fill string) appear in the thread/page as text? Normalized-whitespace
+# containment. WARN (red line): the composer subtree is NEVER evidence — the
+# query sits there before/without a submit — and neither is any ANCESTOR of
+# the composer (main/body innerText includes composer text; the historical
+# containment check on those is exactly the silent-send-failure false bind).
+# Containment runs on skip-excluded text only and `bound:true` requires the
+# evidence to land on ONE concrete non-composer element with non-empty text.
+_JS_BOUND_TMPL = r"""/*PPLX_BOUND_PROBE*/(() => {
+  const q = __QUERY__;
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const nq = norm(q);
+  const out = {bound: false, where: '', tag: '', role: '', label: '', text: ''};
+  if (!nq) return JSON.stringify(out);
+  const all = Array.from(document.querySelectorAll('*'));
+  // skip roots: EVERY contenteditable's form/parent — the composer subtree
+  // in all its shapes (multiple editors, missing form wrapper, ...)
+  const roots = [];
+  for (const ce of document.querySelectorAll('[contenteditable]')) {
+    let root = ce;
+    try { root = ce.closest('form') || ce.parentElement || ce; } catch (e) {}
+    if (root && roots.indexOf(root) === -1) roots.push(root);
+  }
+  const under = (el, root) => { for (let n = el; n; n = n.parentElement) { if (n === root) return true; } return false; };
+  // dead = composer subtree member, composer ANCESTOR (its innerText carries
+  // composer text too), or non-rendered metadata
+  const dead = (el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'noscript'
+        || tag === 'template' || tag === 'head') return true;
+    for (const r of roots) { if (under(el, r) || under(r, el)) return true; }
+    return false;
+  };
+  // containment on skip-excluded text only: the innerText of the OUTERMOST
+  // live elements — never body/main innerText (both can carry the composer)
+  const main = document.querySelector('main');
+  const tops = [];
+  for (const el of all) {
+    if (dead(el)) continue;
+    let nested = false;
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      if (!dead(p)) { nested = true; break; }
+    }
+    if (!nested) tops.push(el);
+  }
+  const textOf = (els) => norm(els.map((e) => e.innerText || e.textContent || '').join(' '));
+  const mainText = textOf(tops.filter((e) => main && under(e, main)));
+  const pageText = textOf(tops);
+  if (main && mainText.includes(nq)) out.where = 'thread';
+  else if (pageText.includes(nq)) out.where = 'page';
+  else return JSON.stringify(out);
+  // bound:true ONLY when the text evidence lands on one concrete
+  // non-composer element (WARN: never on composer state)
+  let best = null, bestLen = Infinity;
+  for (const el of all) {
+    if (dead(el)) continue;
+    const t = norm(el.innerText || el.textContent || '');
+    if (!t || !t.includes(nq)) continue;
+    if (t.length < bestLen) { best = el; bestLen = t.length; }
+  }
+  const btext = best ? norm(best.innerText || best.textContent || '') : '';
+  if (best && btext) {
+    out.bound = true;
+    out.tag = String(best.tagName || '').toLowerCase();
+    out.role = best.getAttribute('role') || '';
+    out.label = best.getAttribute('aria-label') || '';
+    out.text = btext.slice(0, 120);
+  }
+  return JSON.stringify(out);
+})()"""
+
+# ──────────────────────────────────────────────────────────────
 # Locale-aware probe assembly
 #
 # Three probes embed UI text (studied pill / expand control / attachment-chip
@@ -559,6 +722,74 @@ def _short(value: Any, limit: int = 140) -> str:
         return str(value)[:limit]
 
 
+# ──────────────────────────────────────────────────────────────
+# Fallback evidence: sanitized snapshot summaries + runs.jsonl events (D3=B)
+# ──────────────────────────────────────────────────────────────
+
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#]+)\?[^\s]*")
+# suspected secret/token: a long opaque run of token-ish chars carrying BOTH
+# letters and digits (hex ids, api keys, jwt fragments, signed URLs)
+_TOKEN_RE = re.compile(r"(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{16,}")
+
+
+def _sanitize_summary_text(text: Any) -> str:
+    """Strip URL query strings and suspected tokens from evidence text."""
+    s = " ".join(str(text or "").split())
+    s = _URL_QUERY_RE.sub(lambda m: m.group(1), s)
+    s = _TOKEN_RE.sub("[token]", s)
+    return s
+
+
+def _snapshot_summary(*, role: Any = "", label: Any = "", text: Any = "",
+                      limit: int = 80) -> str:
+    """`role/label/text-head` snapshot of a hit element, safe for logs.
+
+    Sanitized BEFORE and AFTER slicing so neither a full token/URL query nor
+    a slice artifact can survive into the ≤80-char summary.
+    """
+    head = _sanitize_summary_text(str(text or ""))[:80]
+    raw = "/".join(p for p in (_sanitize_summary_text(role),
+                              _sanitize_summary_text(label), head) if p)
+    return _sanitize_summary_text(raw)[:limit].strip()
+
+
+def _log_fallback(rung: str, *, status: str, summary: str = "",
+                  detail: Optional[dict] = None) -> None:
+    """D3=B: one runs.jsonl event per fallback trigger (rung/hit/verdict)."""
+    try:
+        path = console_home() / "runs.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec: dict = {"ts": _now_iso(), "op": "fallback", "rung": rung,
+                     "ok": status == "ok", "status": status,
+                     "summary": _sanitize_summary_text(summary)[:80]}
+        if detail:
+            rec["detail"] = detail
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _fallback_history(limit: int = 5) -> dict:
+    """Drift-report `fallbacks` section: cumulative triggers + recent hits."""
+    events: list = []
+    try:
+        text = (console_home() / "runs.jsonl").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        text = ""
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(rec, dict) and rec.get("op") == "fallback":
+            events.append({k: rec.get(k) for k in ("ts", "rung", "ok", "status", "summary")})
+    by_rung: dict = {}
+    for ev in events:
+        by_rung[ev.get("rung") or "?"] = int(by_rung.get(ev.get("rung") or "?", 0)) + 1
+    return {"total": len(events), "by_rung": by_rung, "recent": events[-max(1, limit):]}
+
+
 def _bubble_owns(bubble_text: str, query: str) -> bool:
     """True when a user bubble carries exactly this query (UI appends HH:MM).
 
@@ -773,6 +1004,509 @@ def _press_escape(driver: Any, *, sleep: Callable[[float], None]) -> None:
         sleep(0.12)
 
 
+# ──────────────────────────────────────────────────────────────
+# Fallback rungs (probe → element-table rung → probe.fallback-exhausted)
+#
+# Each rung follows D1=A: the deterministic heuristic below only proposes
+# CANDIDATES; a candidate is adopted only after a semantic readback (and an
+# effect check where the rung acts). A rung that cannot prove its claim
+# returns {"status": "exhausted"} and the caller raises the unified
+# `probe.fallback-exhausted` (D2=A) — never a half result. "unavailable"
+# means the rung's own probes were dead (nothing to fall back onto); the
+# caller then keeps its historical fail-closed error code.
+# ──────────────────────────────────────────────────────────────
+
+FALLBACK_PROSE = "prose-table"
+FALLBACK_OWNERSHIP = "ownership-table"
+FALLBACK_EXPAND = "expand-table"
+
+_PROSE_MIN_CHARS = 200          # readback floor for an adopted answer block
+_PROSE_SENTENCE_PUNCT = "。！？.!?"
+# container semantic weight for the "largest visible content block" score
+_PROSE_WEIGHTS = {"main": 1.4, "article": 1.3, "section": 1.1, "div": 1.0}
+_PROSE_CHROME_HINTS = frozenset({"nav", "aside", "footer", "header", "chrome"})
+
+
+def _table_items(driver: Any) -> Optional[list]:
+    """Element table items, or None when the rung-2 probe is not operational."""
+    payload = _js(driver, _JS_TABLE, None, mutating=False)
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        return payload["items"]
+    return None
+
+
+def _blocks_payload(driver: Any) -> Optional[dict]:
+    """Content-block candidates, or None when the rung-2 probe is dead."""
+    payload = _js(driver, _JS_BLOCKS, None, mutating=False)
+    if isinstance(payload, dict) and isinstance(payload.get("blocks"), list):
+        return payload
+    return None
+
+
+def _bound_payload(driver: Any, query: str) -> Optional[dict]:
+    """Identity-binding read (query text on page/thread), None when dead."""
+    code = _JS_BOUND_TMPL.replace("__QUERY__",
+                                  json.dumps(str(query or ""), ensure_ascii=False))
+    payload = _js(driver, code, None, mutating=False)
+    if isinstance(payload, dict) and "bound" in payload:
+        return payload
+    return None
+
+
+def _block_excluded(block: Any) -> bool:
+    """True for navigation/sidebar/footer chrome or degenerate geometry."""
+    if not isinstance(block, dict):
+        return True
+    if str(block.get("hint") or "") in _PROSE_CHROME_HINTS:
+        return True
+    rect = block.get("rect") or {}
+    return int(rect.get("w") or 0) < 80 or int(rect.get("h") or 0) < 20
+
+
+def _blocks_max_len(payload: Any) -> int:
+    """Length of the largest non-chrome content block (0 when unknown)."""
+    if not isinstance(payload, dict):
+        return 0
+    best = 0
+    for block in payload.get("blocks") or []:
+        if not _block_excluded(block):
+            best = max(best, int(block.get("len") or 0))
+    return best
+
+
+def _answer_block(payload: Any) -> Optional[dict]:
+    """Largest non-chrome content block (the answer-body candidate)."""
+    best = None
+    for block in ((payload or {}).get("blocks") or []):
+        if _block_excluded(block):
+            continue
+        if best is None or int(block.get("len") or 0) > int(best.get("len") or 0):
+            best = block
+    return best
+
+
+def _blocks_fingerprint(text: Any) -> str:
+    """Deterministic fingerprint of a block's normalized text (freshness)."""
+    return hashlib.sha1(_normalize(text).encode("utf-8")).hexdigest()
+
+
+def _blocks_baseline(driver: Any) -> Optional[dict]:
+    """Pre-submit content-block baseline (RC2/RC6 freshness mechanism).
+
+    Snapshot of the CURRENT largest content block (length + fingerprint +
+    DOM index) taken BEFORE this turn is submitted. None when the element-
+    table rung is not operational — callers then keep their historical
+    staleness fallbacks and must flag ``stale_risk`` on adoption.
+    """
+    payload = _blocks_payload(driver)
+    if payload is None:
+        return None
+    best = _answer_block(payload)
+    if best is None:
+        return {"max_len": 0, "fingerprint": "", "i": -1}
+    return {"max_len": int(best.get("len") or 0),
+            "fingerprint": _blocks_fingerprint(best.get("text") or ""),
+            "i": int(best.get("i") or 0)}
+
+
+def _block_is_new(block: Any, baseline: Any) -> bool:
+    """RC2 freshness: a candidate must be NEWER than the pre-submit baseline.
+
+    Newer ⟺ longer than the baseline's largest block (the common growing-
+    answer case), or a different fingerprint positioned at/after the baseline
+    block in the DOM (a later, shorter, different answer — never the previous
+    turn's longer answer). Without a baseline freshness cannot be judged;
+    the caller keeps the historical behavior and flags ``stale_risk``.
+    """
+    if not isinstance(baseline, dict):
+        return True
+    if int(block.get("len") or 0) > int(baseline.get("max_len") or 0):
+        return True
+    return (_blocks_fingerprint(block.get("text") or "")
+            != (baseline.get("fingerprint") or "")
+            and int(block.get("i") or 0) >= int(baseline.get("i") or -1))
+
+
+def _fallback_prose_len(driver: Any) -> Optional[int]:
+    """Count-path fallback (``div.prose`` gone): largest content-block length.
+
+    None when the element-table rung is not operational — callers then keep
+    their historical prose-count behavior.
+    """
+    payload = _blocks_payload(driver)
+    return None if payload is None else _blocks_max_len(payload)
+
+
+def _blocks_have_new(payload: Any, baseline: Any) -> bool:
+    """RC6: some QUALIFIED content block is newer than the pre-submit baseline.
+
+    The fresh block must be a real prose candidate (non-chrome, ≥ readback
+    floor) so incidental UI text (e.g. a short submitted query bubble) never
+    reads as "the new answer landed".
+    """
+    if not isinstance(baseline, dict):
+        return False
+    for block in ((payload or {}).get("blocks") or []):
+        if (_prose_block_score(block) is not None
+                and _block_is_new(block, baseline)):
+            return True
+    return False
+
+
+def _answer_len_now(driver: Any, info: Optional[dict] = None) -> int:
+    """Answer length: ``div.prose`` path first, content-block rung otherwise."""
+    info = info if info is not None else _info(driver)
+    n = int(info.get("lastProseLen") or 0)
+    if n > 0 or int(info.get("proseCount") or 0):
+        return n
+    return _fallback_prose_len(driver) or 0
+
+
+def _prose_block_score(block: Any) -> Optional[float]:
+    """Deterministic prose candidate score (D1=A): length × container weight.
+
+    None when the block is excluded — chrome (nav/sidebar/footer/header by
+    role/aria/class/position), degenerate geometry, or below the readback
+    floor (a candidate must be ≥200 chars anyway).
+    """
+    if _block_excluded(block):
+        return None
+    length = int(block.get("len") or 0)
+    if length < _PROSE_MIN_CHARS:
+        return None
+    if length > len(str(block.get("text") or "")):
+        # RC2: the probe truncates `text` at 4000 chars while `len` is the
+        # full length — a `len > len(text)` block is a HALF candidate and is
+        # never adoptable ("绝不半成品"), however big it is.
+        return None
+    tag = str(block.get("tag") or "")
+    role = str(block.get("role") or "")
+    weight = _PROSE_WEIGHTS.get(tag, 0.8)
+    if role == "main":
+        weight = max(weight, _PROSE_WEIGHTS["main"])
+    return float(length) * weight
+
+
+def _prose_candidates(blocks: Any) -> list:
+    """Best-first candidate order; equal score → later block wins (recency)."""
+    scored = []
+    for block in blocks or []:
+        score = _prose_block_score(block)
+        if score is not None:
+            scored.append((score, int(block.get("i") or 0), block))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [b for _, _, b in scored]
+
+
+def _prose_readback_ok(text: Any) -> bool:
+    """Semantic readback for an adopted answer block."""
+    t = _normalize(text)
+    return (len(t) >= _PROSE_MIN_CHARS
+            and any(c in t for c in _PROSE_SENTENCE_PUNCT))
+
+
+def _prose_fallback_rung(driver: Any, *, gate: str = "extract",
+                         baseline: Optional[dict] = None) -> dict:
+    """Rung 2 for answer-text extraction when `div.prose` is missing/empty.
+
+    RC2 freshness: with a pre-submit ``baseline`` (see
+    :func:`_blocks_baseline`) only blocks NEWER than the baseline are
+    adoptable — the previous turn's longer answer must never be adopted.
+    Without a baseline the historical behavior stands but the result carries
+    ``stale_risk: true`` (honest labeling, never silent).
+    """
+    stale_risk = not isinstance(baseline, dict)
+    guard = NoProgressGuard(gate=gate, driver=driver, what="fallback 语义回读")
+    payload = _blocks_payload(driver)
+    if payload is None:
+        _log_fallback(FALLBACK_PROSE, status="unavailable")
+        return {"status": "unavailable", "fallback_used": FALLBACK_PROSE,
+                "stale_risk": stale_risk}
+    candidates = _prose_candidates(payload.get("blocks") or [])
+    attempts: list = []
+    for cand in candidates:
+        summary = _snapshot_summary(
+            role=cand.get("role") or cand.get("tag") or "",
+            label=cand.get("label") or "",
+            text=str(cand.get("text") or ""))
+        if not _block_is_new(cand, baseline):
+            # RC2 staleness: older-or-equal to the pre-submit baseline block
+            attempts.append({"i": cand.get("i"), "summary": summary,
+                             "readback_ok": False, "stale": True})
+            continue
+        guard.observe({"len": cand.get("len"),
+                       "text": str(cand.get("text") or "")[:200],
+                       "cand": str(cand.get("i") or "")})
+        # semantic readback: an INDEPENDENT second read of the live DOM
+        again = _blocks_payload(driver)
+        rb_text = ""
+        for block in ((again or {}).get("blocks") or []):
+            if block.get("i") == cand.get("i"):
+                rb_text = str(block.get("text") or "")
+                break
+        ok = _prose_readback_ok(rb_text)
+        attempts.append({"i": cand.get("i"), "summary": summary,
+                         "readback_ok": ok, "stale": False})
+        if ok:
+            _log_fallback(FALLBACK_PROSE, status="ok", summary=summary,
+                          detail={"attempts": len(attempts),
+                                  "stale_risk": stale_risk})
+            return {"status": "ok", "fallback_used": FALLBACK_PROSE,
+                    "text": rb_text, "summary": summary, "attempts": attempts,
+                    "stale_risk": stale_risk}
+    summary = attempts[-1]["summary"] if attempts else ""
+    _log_fallback(FALLBACK_PROSE, status="failed", summary=summary,
+                  detail={"candidates": len(candidates),
+                          "attempts": len(attempts),
+                          "stale_risk": stale_risk})
+    return {"status": "exhausted", "fallback_used": FALLBACK_PROSE,
+            "summary": summary, "candidates": len(candidates),
+            "attempts": attempts, "stale_risk": stale_risk}
+
+
+# expand-button labels the fallback rung accepts as near-matches
+_EXPAND_FAMILY = ("展开", "查看更多", "展开更多", "更多", "expand", "show more")
+# RC3(c): the loose contains-arm is narrowed — the label must START the
+# button text (展开…/查看更多…/show more…/expand…) or BE the whole text.
+_EXPAND_STARTS = ("展开", "查看更多", "show more", "expand")
+# …and anything settings/options/load-more shaped is NEVER an expand control
+_EXPAND_REJECT = ("设置", "选项", "加载", "更多设置")
+
+
+def _edit_distance(a: str, b: str, *, cap: int = 3) -> int:
+    """Bounded Levenshtein distance (pure, deterministic)."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+        if min(prev) > cap:
+            return cap + 1
+    return prev[-1]
+
+
+def _expand_candidate_score(item: Any) -> Optional[float]:
+    """Deterministic expand-button candidate filter; lower score = better.
+
+    None = NEVER click: non-button role (follow-up question rows live there),
+    disabled, anything carrying ？/? (the previous review's misfire lesson),
+    settings/options/load-more labels (RC3: 「更多设置」 is not an expand
+    control), or text with no nearness to the expand family at all.
+    """
+    if not isinstance(item, dict):
+        return None
+    tag = str(item.get("tag") or "").lower()
+    role = str(item.get("role") or "").lower()
+    if role and role != "button":
+        return None                      # 非 button role 一律排除
+    if tag != "button" and role != "button":
+        return None
+    if item.get("disabled"):
+        return None
+    text = _normalize(item.get("text") or item.get("label") or "")
+    label = _normalize(item.get("label") or "")
+    joined = (text + " " + label).strip()
+    if not joined or re.search(r"[？?]", joined):
+        return None                      # 含 ？/? = 追问问题按钮，绝不点击
+    low = joined.lower()
+    if any(w in low for w in _EXPAND_REJECT):
+        return None                      # 设置/选项/加载 类按钮绝不点击
+    family = [f.lower() for f in _EXPAND_FAMILY]
+    near = min(_edit_distance(low, f, cap=3) for f in family)
+    loose = (any(low.startswith(p) for p in _EXPAND_STARTS)
+             or low in family)
+    if not loose and near > 2:
+        return None
+    # attempt order: strict text-nearness first (distance ≤2), then the
+    # looser starts-with/equal arm; shorter labels before longer ones
+    arm = float(near) if near <= 2 else 10.0
+    return arm + min(len(joined), 30) / 100.0
+
+
+# A finished answer ends on sentence punctuation; 「…」 or a mid-sentence
+# tail is the deterministic truncation signal (RC3: hunt expand candidates
+# ONLY when an expand control is expected). The scroll probe is deliberately
+# NOT used as a trigger: it mutates (scrollTop/window.scrollTo — drift
+# classifies it "action") and would move the page before the trusted click
+# at cached coordinates.
+_EXPANSION_TAIL_DONE = "。！？.!?"
+
+
+def _expand_truncation_signal(block: Any) -> dict:
+    """Whether the answer looks truncated (an expand control is expected)."""
+    why: list = []
+    if isinstance(block, dict):
+        tail = str(block.get("text") or "").rstrip()
+        if tail.endswith("…") or tail.endswith("..."):
+            why.append("ellipsis-tail")
+        elif tail and tail[-1] not in _EXPANSION_TAIL_DONE:
+            why.append("unterminated-tail")
+    return {"risk": bool(why), "why": why}
+
+
+def _rect_adjacent(a: Any, b: Any, margin: int = 48) -> bool:
+    """True when two rects intersect or sit within ``margin`` px of each other."""
+    try:
+        ax, ay = int(a.get("x") or 0), int(a.get("y") or 0)
+        aw, ah = int(a.get("w") or 0), int(a.get("h") or 0)
+        bx, by = int(b.get("x") or 0), int(b.get("y") or 0)
+        bw, bh = int(b.get("w") or 0), int(b.get("h") or 0)
+    except AttributeError:
+        return False
+    gap_x = max(0, max(bx - (ax + aw), ax - (bx + bw)))
+    gap_y = max(0, max(by - (ay + ah), ay - (by + bh)))
+    return gap_x <= margin and gap_y <= margin
+
+
+def _expand_fallback_rung(driver: Any, *,
+                          sleep: Callable[[float], None],
+                          gate: str = "extract") -> dict:
+    """Rung 2 for the expand control when the exact-label probe fully missed.
+
+    RC3 trigger discipline: candidates are hunted ONLY when the answer looks
+    truncated (ellipsis / mid-sentence tail) — on a healthy page with no
+    expand control this rung must return ``none`` without clicking anything.
+    Candidate clicks are further limited to the answer area (rect adjacent
+    to the largest content block) and verified by effect (the content block
+    must GROW) via trusted CDP mouse events; a click that grows nothing is
+    not success.
+    """
+    items = _table_items(driver)
+    if items is None:
+        # RC5: every fallback trigger leaves a runs.jsonl event (D3=B)
+        _log_fallback(FALLBACK_EXPAND, status="unavailable")
+        return {"status": "unavailable", "fallback_used": FALLBACK_EXPAND}
+    payload = _blocks_payload(driver)
+    block = _answer_block(payload)
+    trigger = _expand_truncation_signal(block)
+    if not trigger["risk"]:
+        _log_fallback(FALLBACK_EXPAND, status="none",
+                      detail={"trigger": "no-truncation-signal"})
+        return {"status": "none", "fallback_used": FALLBACK_EXPAND}
+    scored = []
+    for item in items:
+        score = _expand_candidate_score(item)
+        if score is None:
+            continue
+        rect = item.get("rect") if isinstance(item.get("rect"), dict) else {}
+        if block is not None and not _rect_adjacent(rect, block.get("rect") or {}):
+            continue        # RC3(b): answer-area candidates only
+        scored.append((score, -int(item.get("i") or 0), item))
+    if not scored:
+        # nothing expand-like near the answer: nothing to expand — not a failure
+        _log_fallback(FALLBACK_EXPAND, status="none",
+                      detail={"trigger": ",".join(trigger["why"]),
+                              "candidates": 0})
+        return {"status": "none", "fallback_used": FALLBACK_EXPAND}
+    scored.sort(key=lambda t: (t[0], t[1]))
+    guard = NoProgressGuard(gate=gate, driver=driver, what="fallback 效果验证")
+    attempts: list = []
+    for _, _, cand in scored:
+        summary = _snapshot_summary(
+            role=cand.get("role") or cand.get("tag") or "",
+            label=cand.get("label") or "",
+            text=str(cand.get("text") or ""))
+        # readback: the candidate must still be the same live button
+        again = _table_items(driver)
+        rb = next((b for b in (again or [])
+                   if b.get("i") == cand.get("i")), None)
+        rb_ok = (rb is not None and not rb.get("disabled")
+                 and _normalize(rb.get("text") or "")
+                 == _normalize(cand.get("text") or ""))
+        if not rb_ok:
+            attempts.append({"i": cand.get("i"), "summary": summary,
+                             "readback_ok": False})
+            continue
+        before = _blocks_max_len(_blocks_payload(driver))
+        rect = cand.get("rect") or {}
+        cx = int(rect.get("x") or 0) + int(rect.get("w") or 0) // 2
+        cy = int(rect.get("y") or 0) + int(rect.get("h") or 0) // 2
+        # RC4: the sample carries the candidate identity (index + click
+        # coords, in a key geometry-stripping keeps) so N sibling buttons
+        # with the same text are N different actions — only a REPEATED
+        # same-index candidate with zero progress reads as frozen.
+        guard.observe({"before": before,
+                       "text": _normalize(cand.get("text") or "")[:60],
+                       "cand": f"{cand.get('i')}:{cx},{cy}"})
+        _cdp_click(driver, cx, cy, sleep=sleep)
+        sleep(1.0)
+        after = _blocks_max_len(_blocks_payload(driver))
+        grew = after > before
+        attempts.append({"i": cand.get("i"), "summary": summary,
+                         "readback_ok": True, "grew": grew,
+                         "before": before, "after": after})
+        if grew:
+            _log_fallback(FALLBACK_EXPAND, status="ok", summary=summary,
+                          detail={"attempts": len(attempts)})
+            return {"status": "ok", "fallback_used": FALLBACK_EXPAND,
+                    "summary": summary, "attempts": attempts}
+    summary = attempts[-1]["summary"] if attempts else ""
+    _log_fallback(FALLBACK_EXPAND, status="failed", summary=summary,
+                  detail={"candidates": len(scored), "attempts": len(attempts)})
+    return {"status": "exhausted", "fallback_used": FALLBACK_EXPAND,
+            "summary": summary, "candidates": len(scored), "attempts": attempts}
+
+
+def _ownership_fallback_rung(driver: Any, query: str, *,
+                             base_studied: Optional[int] = None,
+                             timeout: float, poll: float,
+                             sleep: Callable[[float], None]) -> dict:
+    """Rung 2 for submit ownership when the user-bubble anchor is dead.
+
+    WARN red line (highest constraint): composer state, URL changes and
+    count changes alone can NEVER prove ownership. Ownership is claimed only
+    with BOTH — (1) an independent identity binding: this turn's query text
+    (the exact fill string, normalized-whitespace containment) present in
+    the thread/page, never in the composer; AND (2) an effect signal: the
+    answer area starts growing or the completion-marker count increases.
+    Anything less → ``probe.fallback-exhausted`` (fail-closed).
+    """
+    guard = NoProgressGuard(gate="submit", driver=driver, what="fallback 归属轮询")
+    first = _bound_payload(driver, query)
+    if first is None:
+        _log_fallback(FALLBACK_OWNERSHIP, status="unavailable")
+        return {"status": "unavailable", "fallback_used": FALLBACK_OWNERSHIP}
+    info0 = _info(driver)
+    len0 = _answer_len_now(driver, info0)
+    studied0 = (int(base_studied) if base_studied is not None
+                else int(info0.get("studied") or 0))
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    bound: dict = first
+    while True:
+        info = _info(driver)
+        cur = _bound_payload(driver, query)
+        if cur is not None:
+            bound = cur
+        # RC1 (WARN): `bound:true` alone is not evidence — the text must have
+        # landed on a concrete non-composer element (the probe's `text`).
+        bound_ok = bool(bound.get("bound")) and bool(bound.get("text"))
+        ans_len = _answer_len_now(driver, info)
+        effect = (int(info.get("studied") or 0) > studied0) or (ans_len > len0)
+        summary = _snapshot_summary(role=bound.get("role") or bound.get("tag") or "",
+                                    label=bound.get("label") or "",
+                                    text=bound.get("text") or "")
+        # RC4: the ok-check runs BEFORE guard.observe (same order as the main
+        # path's _wait_ownership) — a landing ownership win always beats the
+        # breaker.
+        if bound_ok and effect:
+            _log_fallback(FALLBACK_OWNERSHIP, status="ok", summary=summary,
+                          detail={"where": bound.get("where"),
+                                  "bound": True, "effect": True})
+            return {"status": "ok", "fallback_used": FALLBACK_OWNERSHIP,
+                    "summary": summary, "bound_where": bound.get("where"),
+                    "bound": True, "effect": True}
+        guard.observe({**info, "bound": bound_ok, "ans_len": ans_len})
+        if time.monotonic() >= deadline:
+            _log_fallback(FALLBACK_OWNERSHIP, status="failed", summary=summary,
+                          detail={"bound": bound_ok, "effect": effect})
+            return {"status": "exhausted", "fallback_used": FALLBACK_OWNERSHIP,
+                    "summary": summary, "bound": bound_ok, "effect": effect}
+        sleep(max(poll, 0.05))
+
+
 def _make_driver(cfg: Config, state: dict) -> Any:
     from .drivers.webbridge import WebBridgeDriver
     return WebBridgeDriver(cfg.webbridge_url, session=state.get("session") or DEFAULT_SESSION)
@@ -930,7 +1664,8 @@ def _ownership_or_exhausted(driver: Any, query: str, base_bubbles: int, *, timeo
 
 def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
                  timeout: float, poll: float,
-                 sleep: Callable[[float], None]) -> dict:
+                 sleep: Callable[[float], None],
+                 base_studied: Optional[int] = None) -> dict:
     """Gate 2: verify the composer once more, then submit.
 
     A late async draft-restore can merge extra text into the composer AFTER
@@ -993,6 +1728,47 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
     if owned:
         return {"ok": True, "mechanism": "combo", "actions": actions}
 
+    # Rung 3: element-table ownership fallback — only when the user-bubble
+    # anchor is DEAD (no new turn marker at all). A bubble that appeared but
+    # does not own the query is a failed gate, not a missing anchor, and
+    # keeps the historical error codes below. WARN: this rung claims
+    # ownership ONLY with an independent query-text binding plus an effect
+    # signal — never on composer/URL/count changes alone.
+    info_now = _info(driver)
+    if int(info_now.get("bubbles") or 0) <= base_bubbles:
+        fb = _ownership_fallback_rung(
+            driver, query, base_studied=base_studied,
+            timeout=timeout, poll=poll, sleep=sleep)
+        if fb.get("status") == "ok":
+            actions.append({"action": "ownership-fallback", "result": "ok",
+                            "bound_where": fb.get("bound_where")})
+            return {"ok": True, "mechanism": "ownership-fallback",
+                    "actions": actions,
+                    "fallback_used": fb.get("fallback_used"),
+                    "fallback_summary": fb.get("summary", "")}
+        if fb.get("status") == "exhausted":
+            # D2=A: the fallback also failed → unified fail-closed code.
+            raise ConsoleError(
+                "submit",
+                f"no user-bubble anchor AND the element-table ownership rung "
+                f"could not prove ownership (query-text binding="
+                f"{bool(fb.get('bound'))}, effect-signal={bool(fb.get('effect'))})"
+                f" — fail-closed: BOTH an independent identity binding and an "
+                f"effect signal are required (composer/URL/count alone never "
+                f"prove ownership)",
+                gates={"submit": {
+                    "ok": False,
+                    "fallback": {k: v for k, v in fb.items() if k != "text"},
+                    "no_progress": {
+                        "limit": NO_PROGRESS_LIMIT,
+                        "rungs": {**{rung: ("tripped" if np is not None else "timeout")
+                                     for rung, np in trips},
+                                  "fallback": "exhausted"},
+                        "tripped": [r for r, np in trips if np is not None],
+                        "detail": {rung: np for rung, np in trips if np is not None},
+                    }}},
+                evidence=_evidence(driver), code="probe.fallback-exhausted")
+
     last = _info(driver).get("lastBubble") or ""
     detail = f"no new user turn observed after submit attempts (last bubble: {str(last)[:80]!r})"
     tripped_rungs = [rung for rung, np in trips if np is not None]
@@ -1028,6 +1804,7 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
 def _gate_complete(driver: Any, base_studied: int, *,
                    base_prose_count: int = 0,
                    base_len: Optional[int] = None,
+                   base_blocks: Optional[dict] = None,
                    wait_budget: float, poll: float,
                    sleep: Callable[[float], None],
                    monotonic: Callable[[], float] = time.monotonic,
@@ -1040,6 +1817,14 @@ def _gate_complete(driver: Any, base_studied: int, *,
     ``base_len`` baseline is supplied, ``lastProseLen > base_len``) before
     stability counts (observed live 2026-09-21: a slow file-bearing answer let
     a naive stability check extract the previous turn's answer).
+
+    Count-path (``div.prose`` gone): new-answer detection runs on the
+    element-table rung's content blocks against the pre-submit ``base_blocks``
+    baseline (same freshness mechanism as the prose fallback rung, RC6) — a
+    fast answer that renders COMPLETELY before the first poll is new on that
+    first poll, and a stale previous block never is. Without ``base_blocks``
+    the historical first-sample baseline stands (staleness-safe, but a fast
+    full render can then not prove novelty).
 
     v2 (live-verified 2026-09-23) adds three fail-safe layers on top of the
     deterministic ``_answer_settled`` v2.2 predicate:
@@ -1068,6 +1853,7 @@ def _gate_complete(driver: Any, base_studied: int, *,
     stall_seconds = 20 * poll_eff
     extensions = 0
     prev_len = base_len if base_len is not None else -1
+    base_fb_len: Optional[int] = None   # staleness baseline for the count-path rung
     stable = 0
     empty_run = 0
     done_seen = False
@@ -1097,6 +1883,22 @@ def _gate_complete(driver: Any, base_studied: int, *,
             done_seen = True
         now = monotonic()
         length = int(info.get("lastProseLen") or 0)
+        fb_payload = None
+        fb_len = None
+        if length <= 0 and not int(info.get("proseCount") or 0):
+            # `div.prose` is gone: count-path fallback (element-table rung).
+            # RC6: novelty is judged against the PRE-SUBMIT blocks baseline
+            # (a fully rendered fast answer is new on its first sample and a
+            # stale previous block never is); without one the first prose-dead
+            # sample keeps serving as the staleness baseline — a stale block
+            # can still never settle.
+            fb_payload = _blocks_payload(driver)
+            fb_block = _answer_block(fb_payload)
+            if fb_block is not None:
+                fb_len = int(fb_block.get("len") or 0)
+                if base_fb_len is None:
+                    base_fb_len = fb_len
+                length = fb_len
         if length != prev_len:
             if length > prev_len:
                 last_change_at = now
@@ -1108,8 +1910,17 @@ def _gate_complete(driver: Any, base_studied: int, *,
         if busy and stable * poll_eff >= stall_seconds:
             contradiction = True   # busy signal present but content frozen
         new_seen = ((base_len is not None and length > base_len)
-                    or int(info.get("proseCount") or 0) > base_prose_count)
-        settled, signal = _answer_settled(info, prev_len, stable,
+                    or int(info.get("proseCount") or 0) > base_prose_count
+                    or (fb_len is not None and base_fb_len is not None
+                        and fb_len > base_fb_len)
+                    or (fb_payload is not None and base_blocks is not None
+                        and _blocks_have_new(fb_payload, base_blocks)))
+        info_eff = info
+        if fb_len:
+            # feed the deterministic settle predicate the count-path values
+            info_eff = {**info, "lastProseLen": length,
+                        "proseCount": max(int(info.get("proseCount") or 0), 1)}
+        settled, signal = _answer_settled(info_eff, prev_len, stable,
                                           new_seen=new_seen)
         if settled:
             break
@@ -1137,7 +1948,7 @@ def _gate_complete(driver: Any, base_studied: int, *,
     elapsed = monotonic() - start
     return {"ok": True, "new_seen": new_seen, "done_seen": done_seen,
             "method": signal or "length-only", "signal": signal or "length-only",
-            "stable": stable, "chars": int(info.get("lastProseLen") or 0),
+            "stable": stable, "chars": length,
             "studied": int(info.get("studied") or 0),
             "generating": bool(info.get("generating")),
             "contradiction": contradiction,
@@ -1421,6 +2232,11 @@ def _stage_fill(drv: Any, state: dict, cfg: Config, query: str, *,
     ctx = _ensure_task_context(drv, state, task=task, new_thread=new_thread,
                                cfg=cfg, sleep=sleep)
     gates: dict = {"attach": ctx["attach"]}
+    # RC2/RC6 freshness baseline: content-block snapshot BEFORE this turn is
+    # submitted — fallback adoption and count-path new-answer detection must
+    # be NEWER than this (a previous turn's answer must never be adopted or
+    # settle as this turn's).
+    base_blocks = _blocks_baseline(drv)
     file_names = [Path(f).expanduser().name for f in (files or [])]
     file_paths = [str(Path(f).expanduser()) for f in (files or [])]
     if files:
@@ -1460,6 +2276,7 @@ def _stage_fill(drv: Any, state: dict, cfg: Config, query: str, *,
         "base_bubbles": int(pre.get("bubbles") or 0),
         "base_studied": int(pre.get("studied") or 0),
         "base_prose_count": int(pre.get("proseCount") or 0),
+        "base_blocks": base_blocks,
         "filled_at": _now_iso(),
         "status": "filled",
     }
@@ -1476,7 +2293,8 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
                           sleep: Callable[[float], None],
                           context_gates: Optional[dict] = None,
                           gates_out: Optional[dict] = None,
-                          expect_url: Optional[str] = None) -> dict:
+                          expect_url: Optional[str] = None,
+                          base_studied: Optional[int] = None) -> dict:
     """Submit gate with bounded recovery (delayed ownership → reload+retry).
 
     The recovery is duplicate-safe: it only re-submits after a delayed
@@ -1488,13 +2306,19 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
             raise ConsoleError(
                 "pending",
                 f"page moved: staged on {expect_url!r}, currently at {current!r}; "
-                "run `console fill` again",
+                f"run `console fill` again",
                 code="pending.page-moved")
     try:
         return _gate_submit(drv, query, base_bubbles,
-                            timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+                            timeout=submit_timeout, poll=poll_interval,
+                            sleep=sleep, base_studied=base_studied)
     except ConsoleError as submit_exc:
         if submit_exc.gate != "submit":
+            raise
+        if submit_exc.code == "probe.fallback-exhausted":
+            # WARN red line: without an independent identity binding the
+            # ownership claim can never be recovered by reloading/re-sending —
+            # stop here (fail-closed), never retry a send on missing evidence.
             raise
         # First, give a slow/duplicated ownership read one more chance so a
         # late-but-correct turn never gets sent twice. A breaker trip here
@@ -1521,7 +2345,8 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
                 gates_out["files_retry"] = files_retry
         try:
             result = _gate_submit(drv, query, base_bubbles,
-                                  timeout=submit_timeout, poll=poll_interval, sleep=sleep)
+                                  timeout=submit_timeout, poll=poll_interval,
+                                  sleep=sleep, base_studied=base_studied)
             result["recovered"] = "reload"
             return result
         except ConsoleError as exc2:
@@ -1605,27 +2430,76 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
     staged turn is NOT consumed and thread turn counts are NOT incremented.
     """
     gates = gates_out if gates_out is not None else {}
+    fallback_used: list = []
+    fallback_summary = ""
 
     expand = _js(drv, _probe("expand"), "none")
     if expand == "clicked":
         sleep(1.0)
-    gates["expand"] = expand
+        gates["expand"] = expand
+    else:
+        # Rung 2 for the expand control: the exact-label probe fully missed.
+        # Candidates come from the element table and only count as success
+        # after readback + effect verification (the content block must GROW).
+        fb = _expand_fallback_rung(drv, sleep=sleep)
+        gates["expand"] = expand
+        if fb.get("status") not in ("unavailable", "none"):
+            gates["expand_fallback"] = {k: v for k, v in fb.items() if k != "text"}
+        if fb.get("status") == "ok":
+            fallback_used.append(fb["fallback_used"])
+            fallback_summary = fb.get("summary", "")
+        elif fb.get("status") == "exhausted":
+            raise ConsoleError(
+                "extract",
+                f"expand control missed by the probe AND the element-table "
+                f"fallback could not verify a candidate ({fb.get('candidates', 0)}"
+                f" candidate(s), no click grew the answer) — fail-closed",
+                gates=gates, evidence=_evidence(drv),
+                code="probe.fallback-exhausted")
 
     # T5: lazy rendering appends while scrolling — reach the bottom first and
     # record the settle verdict as its own gate (advisory, never blocks).
     scroll_out = _scroll_to_bottom(
         drv,
-        prose_len=lambda: int((_info(drv) or {}).get("lastProseLen") or 0),
+        prose_len=lambda: _answer_len_now(drv),
         sleep=sleep)
     gates["scroll"] = scroll_out
 
     prose = _js(drv, _JS_PROSE, {}, mutating=False)
     if (not isinstance(prose, dict) or not prose.get("found")
             or not _normalize(prose.get("text"))):
-        gates["extract"] = {"ok": False}
-        raise ConsoleError("extract", "latest answer text is empty",
-                           gates=gates, evidence=_evidence(drv), code="extract.empty")
-    gates["extract"] = {"ok": True, "chars": len(prose["text"])}
+        # Rung 2 for the answer text (`div.prose` missing/empty): adopt the
+        # largest qualified content block only after a semantic readback —
+        # and, with the pre-submit baseline (RC2), only when it is NEWER.
+        fb = _prose_fallback_rung(
+            drv, baseline=(pending or {}).get("base_blocks"))
+        if fb.get("status") == "ok":
+            prose = {"found": True, "text": fb["text"], "raw": fb["text"]}
+            fallback_used.append(fb["fallback_used"])
+            fallback_summary = fb.get("summary", "")
+            gates["extract"] = {"ok": True, "chars": len(prose["text"]),
+                                "fallback_used": fb["fallback_used"],
+                                "fallback_summary": fb.get("summary", ""),
+                                "stale_risk": bool(fb.get("stale_risk"))}
+        elif fb.get("status") == "exhausted":
+            gates["extract"] = {"ok": False,
+                                "fallback_used": fb.get("fallback_used"),
+                                "fallback_summary": fb.get("summary", ""),
+                                "fallback_candidates": fb.get("candidates", 0)}
+            raise ConsoleError(
+                "extract",
+                f"latest answer text is empty and the element-table fallback "
+                f"had no adoptable content block ({fb.get('candidates', 0)}"
+                f" candidate(s)) — fail-closed",
+                gates=gates, evidence=_evidence(drv),
+                code="probe.fallback-exhausted")
+        else:
+            gates["extract"] = {"ok": False}
+            raise ConsoleError("extract", "latest answer text is empty",
+                               gates=gates, evidence=_evidence(drv),
+                               code="extract.empty")
+    else:
+        gates["extract"] = {"ok": True, "chars": len(prose["text"])}
 
     file_names = list((pending or {}).get("files") or [])
     if file_names:
@@ -1681,6 +2555,8 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
         "title": post.get("title") or "",
         "model": post.get("model") or "",
         "consumed": bool(pending and consume),
+        **({"fallback_used": ",".join(fallback_used),
+            "fallback_summary": fallback_summary} if fallback_used else {}),
         **_truncation_risk_fields(prose["text"], still_generating=busy),
     }
 
@@ -1719,11 +2595,13 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
             submit_timeout=submit_timeout,
             submit_recheck_timeout=submit_recheck_timeout,
             poll_interval=poll_interval, sleep=sleep, context_gates=gates,
-            gates_out=gates)
+            gates_out=gates,
+            base_studied=pending.get("base_studied"))
 
         gates["complete"] = _gate_complete(
             drv, pending["base_studied"],
             base_prose_count=pending["base_prose_count"],
+            base_blocks=pending.get("base_blocks"),
             wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
 
         out = _extract_step(drv, state, cfg, sleep=sleep, pending=pending,
@@ -1748,6 +2626,9 @@ def console_ask(query: str, *, task: str = "default", new_thread: bool = False,
             "new_thread": new_thread,
             "gates": gates,
             "elapsed_s": round(time.monotonic() - started, 1),
+            **({"fallback_used": out["fallback_used"],
+                "fallback_summary": out.get("fallback_summary", "")}
+               if out.get("fallback_used") else {}),
         }
     except ConsoleError as exc:
         # T8: the composite ask/send path records every failure too
@@ -1921,7 +2802,8 @@ def console_submit(*, config: Optional[Config] = None, driver: Any = None,
                 submit_timeout=submit_timeout,
                 submit_recheck_timeout=submit_recheck_timeout,
                 poll_interval=poll_interval, sleep=sleep, context_gates={},
-                gates_out=gates, expect_url=pending.get("url"))
+                gates_out=gates, expect_url=pending.get("url"),
+                base_studied=pending.get("base_studied"))
             break
         except ConsoleError as exc:
             if not (allow_reattach and not reattached
@@ -1991,6 +2873,7 @@ def console_wait(*, config: Optional[Config] = None, driver: Any = None,
         pending = _pending_require(state, stage="wait")
         gate = _gate_complete(drv, int(pending.get("base_studied") or 0),
                               base_prose_count=int(pending.get("base_prose_count") or 0),
+                              base_blocks=pending.get("base_blocks"),
                               wait_budget=wait_budget, poll=poll_interval, sleep=sleep)
         pending["completed_at"] = _now_iso()
         pending["status"] = "completed"
@@ -2081,7 +2964,8 @@ def console_send(query: str, *, task: str = "default", new_thread: bool = False,
             submit_timeout=submit_timeout,
             submit_recheck_timeout=submit_recheck_timeout,
             poll_interval=poll_interval, sleep=sleep, context_gates=gates,
-            gates_out=gates)
+            gates_out=gates,
+            base_studied=pending.get("base_studied"))
         pending["submitted_at"] = _now_iso()
         pending["status"] = "submitted"
         state["pending"] = pending
@@ -2396,6 +3280,7 @@ def console_drift(driver: Any = None, *, config: Optional[Config] = None) -> dic
               "anomalies": len(anomalies)}
     return {"ok": not anomalies, "kind": "drift", "locale": locale,
             "probes": probes, "missing_found": missing, "anomalies": anomalies,
+            "fallbacks": _fallback_history(),
             "counts": counts}
 
 

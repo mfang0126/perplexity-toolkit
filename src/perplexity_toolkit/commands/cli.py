@@ -98,7 +98,16 @@ def _t_drift(payload: dict) -> list:
         lines.append("missing_found: " + ", ".join(payload["missing_found"]))
     for note in payload.get("anomalies") or []:
         lines.append(f"  ⚠ {note}")
-    lines.append("verdict: " + ("clean — no drift detected" if payload.get("ok")
+    fb = payload.get("fallbacks") or {}
+    by_rung = fb.get("by_rung") or {}
+    head = f"fallbacks: {fb.get('total', 0)} total"
+    if by_rung:
+        head += " (" + ", ".join(f"{k}×{v}" for k, v in by_rung.items()) + ")"
+    lines.append(head)
+    for ev in fb.get("recent") or []:
+        lines.append(f"  recent: {ev.get('ts', '')} {ev.get('rung', '')} "
+                     f"ok={str(ev.get('ok')).lower()} {ev.get('summary', '')}")
+    lines.append("verdict: " + (f"clean — no drift detected" if payload.get("ok")
                                 else f"{counts.get('anomalies', 0)} anomaly(ies)"))
     return lines
 
