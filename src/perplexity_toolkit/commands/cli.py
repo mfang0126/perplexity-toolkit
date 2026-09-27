@@ -75,10 +75,38 @@ def _console_run_step(fn, fmt: str, *, args=(), kwargs=None,
     return payload
 
 
+def _t_drift(payload: dict) -> list:
+    """Human-readable rendering of the read-only probe drift report."""
+    counts = payload.get("counts") or {}
+    lines = [f"drift report: {counts.get('total', 0)} probes "
+             f"({counts.get('executed', 0)} read-only executed, "
+             f"{counts.get('action', 0)} action-class static-only)  "
+             f"locale={payload.get('locale')}"]
+    for name, entry in (payload.get("probes") or {}).items():
+        if entry.get("error"):
+            lines.append(f"  {name:<13} read   ERROR {entry['error']}")
+        elif entry.get("mode") == "action":
+            mark = "markers-ok" if entry.get("markers_ok") else "MARKERS-LOST"
+            found = ("" if entry.get("found") is None
+                     else f"  found={str(entry.get('found')).lower()}")
+            lines.append(f"  {name:<13} action static-only [{mark}]{found} "
+                         f"— {entry.get('reason')}")
+        else:
+            summary = json.dumps(entry.get("summary") or {}, ensure_ascii=False)
+            lines.append(f"  {name:<13} read   found={entry.get('found')}  {summary}")
+    if payload.get("missing_found"):
+        lines.append("missing_found: " + ", ".join(payload["missing_found"]))
+    for note in payload.get("anomalies") or []:
+        lines.append(f"  ⚠ {note}")
+    lines.append("verdict: " + ("clean — no drift detected" if payload.get("ok")
+                                else f"{counts.get('anomalies', 0)} anomaly(ies)"))
+    return lines
+
+
 def cmd_console(args) -> int:
     """Resident Perplexity console actions."""
     from ..console import (ConsoleError, console_ask, console_attach, console_detach,
-                           console_extract, console_files, console_fill,
+                           console_drift, console_extract, console_files, console_fill,
                            console_models, console_open, console_selfcheck,
                            console_send, console_set_model, console_status,
                            console_submit, console_threads, console_wait)
@@ -170,6 +198,13 @@ def cmd_console(args) -> int:
                 print(f"{marker} {name}: {entry.get('label', '')} "
                       f"[turns={entry.get('turns', '?')}] {entry.get('url', '')}")
         return 0
+
+    if action == "drift" or (action == "selfcheck" and getattr(args, "drift", False)):
+        # Read-only probe drift report. `selfcheck --drift` is the alias: the
+        # bare `selfcheck` action keeps its original meaning (run the full
+        # gate pipeline on a canned query).
+        payload = _console_run_step(console_drift, fmt, text_lines=_t_drift)
+        return 0 if payload and payload.get("ok") else 1
 
     if action == "selfcheck":
         result = console_selfcheck(wait_budget=args.wait_budget)
@@ -314,7 +349,7 @@ def cmd_console(args) -> int:
         return 0 if ok else 1
 
     print("usage: perplexity console {ask,send,fill,submit,wait,extract,attach,files,"
-          "detach,open,models,model,status,threads,selfcheck} ...")
+          "detach,open,models,model,status,threads,drift,selfcheck} ...")
     return 2
 
 
@@ -523,6 +558,11 @@ def build_parser() -> argparse.ArgumentParser:
     pc = csub.add_parser("selfcheck", help="Run the full gate pipeline on a canned query")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc.add_argument("--wait", dest="wait_budget", type=float, default=120.0)
+    pc.add_argument("--drift", action="store_true",
+                    help="Read-only probe drift report instead of the canned run")
+    pc = csub.add_parser("drift",
+                         help="Read-only probe drift report (12 probes; never clicks or types)")
+    pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc = csub.add_parser("models", help="List selectable Perplexity models")
     pc.add_argument("-f", "--format", default="text", choices=["text", "json"])
     pc = csub.add_parser("model", help="Switch the composer model (verified readback)")

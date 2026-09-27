@@ -16,6 +16,8 @@ models the live-mapped perplexity.ai behavior:
 """
 import json
 import re
+import shutil
+import subprocess
 import sys; sys.path.insert(0, "src")
 
 import pytest
@@ -68,7 +70,9 @@ class ConsoleFakeDriver(BrowserDriver):
                  race_draft_text="旧草稿", force_btn_disabled=False,
                  btn_missing_first_click=0, desync_until_reload=False,
                  desync_recover_after=1, busy=False,
-                 tab_visible=True, bring_to_front_works=True):
+                 tab_visible=True, bring_to_front_works=True,
+                 no_progress=False, chips_never_appear=False,
+                 chips_appear_after=0):
         self.url = url
         self.answer = answer
         self.share_tab = share_tab
@@ -118,6 +122,16 @@ class ConsoleFakeDriver(BrowserDriver):
         self.busy = busy   # still-generating page: busy stop + non-idle icon
         self.tab_visible = tab_visible  # hidden tabs silently drop trusted clicks
         self.bring_to_front_works = bring_to_front_works
+        # "never progresses" scripts for the no-progress circuit breaker:
+        # `no_progress` — a submit action that lands nowhere (no new bubble,
+        # no prose, no URL change), `chips_never_appear` — attachments never
+        # surface as chips no matter how long the gate polls,
+        # `chips_appear_after` — chips surface only after N chip polls
+        # (slow upload: the chip wait must tolerate this, not breaker-trip).
+        self.no_progress = no_progress
+        self.chips_never_appear = chips_never_appear
+        self.chips_appear_after = chips_appear_after
+        self._chip_polls = 0
 
     def _btn_state(self):
         """The submit button mirrors the editor's internal state."""
@@ -272,6 +286,11 @@ class ConsoleFakeDriver(BrowserDriver):
                 return "clicked"
             return "not-found"
         if "移除 " in code:
+            if self.chips_never_appear:
+                return {"attachments": []}
+            self._chip_polls += 1
+            if self.chips_appear_after and self._chip_polls <= self.chips_appear_after:
+                return {"attachments": []}   # chip not surfaced yet (slow page)
             return {"attachments": list(self.attachments)}
         if "aria-haspopup" in code:
             return {"found": True, "label": self.model,
@@ -294,6 +313,11 @@ class ConsoleFakeDriver(BrowserDriver):
 
     def _submit(self):
         if self.submit_disabled:
+            return
+        if self.no_progress:
+            # scripted zero-progress run: the action fires, the page never
+            # reacts (no bubble, no prose, no URL change) — the exact case
+            # the no-progress circuit breaker must catch.
             return
         query = self.composer.strip()
         if not query:
@@ -1797,3 +1821,659 @@ class TestFailureLoggingAndReattach:
         assert exc.value.code == "pending.page-moved"
         assert opened == []               # no re-attach attempted
         assert drv.bubbles == []          # nothing was sent
+
+
+# ──────────────────────────────────────────────────────────────
+# e: no-progress circuit breaker (repeated-action guard)
+# ──────────────────────────────────────────────────────────────
+
+INFO_PROBE_PREFIX = "(() => {\n  const btns"
+CHIPS_PROBE_PREFIX = "(() => {\n  const PREFIX"
+
+
+def _eval_polls(drv, prefix):
+    """How many times a specific probe was executed against the driver."""
+    return len([c for c in drv.calls
+                if c[0] == "evaluate" and c[1].startswith(prefix)])
+
+
+class TestNoProgressGuard:
+    """The guard itself: N identical substantive samples => act.no-progress."""
+
+    def test_breaker_trips_on_the_third_identical_poll(self):
+        guard = console.NoProgressGuard(gate="submit")
+        frozen = {"url": "u", "bubbles": 0, "proseCount": 0}
+        guard.observe(dict(frozen))
+        guard.observe(dict(frozen))
+        assert guard.streak == 2
+        with pytest.raises(ConsoleError) as exc:
+            guard.observe(dict(frozen))
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gate == "submit"
+        assert "no substantive progress" in exc.value.message
+        detail = exc.value.gates["submit"]["no_progress"]
+        assert detail["streak"] == 3 and detail["limit"] == 3
+        assert guard.streak == 3 and guard.samples == 3
+
+    def test_any_substantive_change_resets_the_streak(self):
+        guard = console.NoProgressGuard(gate="submit")
+        guard.observe({"bubbles": 0, "proseCount": 0})
+        guard.observe({"bubbles": 0, "proseCount": 0})
+        assert guard.streak == 2
+        guard.observe({"bubbles": 1, "proseCount": 0})   # new user turn
+        assert guard.streak == 1
+        guard.observe({"bubbles": 1, "proseCount": 1})   # answer landing
+        assert guard.streak == 1
+        guard.observe({"bubbles": 1, "proseCount": 1})
+        assert guard.streak == 2
+        with pytest.raises(ConsoleError) as exc:
+            guard.observe({"bubbles": 1, "proseCount": 1})
+        assert exc.value.code == "act.no-progress"
+
+    def test_rect_and_pixel_jitter_is_never_progress(self):
+        # the lesson: a sub-pixel wobble must not keep a dead action alive
+        guard = console.NoProgressGuard(gate="act")
+        guard.observe({"url": "u", "rect": {"x": 10, "y": 4}, "height": 40})
+        guard.observe({"url": "u", "rect": {"x": 11, "y": 4}, "height": 41})
+        assert guard.streak == 2       # geometry jitter never resets the streak
+        with pytest.raises(ConsoleError) as exc:
+            guard.observe({"url": "u", "rect": {"x": 12, "y": 4}, "height": 42})
+        assert exc.value.code == "act.no-progress"
+        # identical substantive shape, different numbers => identical signature
+        assert (console._progress_signature({"rect": {"x": 1}, "y": 9})
+                == console._progress_signature({"rect": {"x": 999}, "y": 9}))
+
+    def test_url_and_prose_length_count_as_progress(self):
+        guard = console.NoProgressGuard(gate="complete", limit=3)
+        guard.observe({"url": "https://a", "lastProseLen": 10})
+        guard.observe({"url": "https://a", "lastProseLen": 10})
+        guard.observe({"url": "https://a", "lastProseLen": 20})
+        assert guard.streak == 1
+        guard.observe({"url": "https://b", "lastProseLen": 20})
+        assert guard.streak == 1
+        guard.reset()
+        assert guard.streak == 0 and guard.samples == 0
+
+
+class TestNoProgressInWaits:
+    """Wiring: the breaker lives inside the poll/wait loops."""
+
+    def test_ownership_wait_breaks_on_a_frozen_page(self):
+        drv = ConsoleFakeDriver(share_tab=True, no_progress=True)
+        with pytest.raises(ConsoleError) as exc:
+            console._wait_ownership(drv, "q-熔断", 0, timeout=30.0,
+                                    poll=0.01, sleep=NOOP)
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gate == "submit"
+        # exactly 3 polls — the breaker fired, the 30s budget never ran
+        assert _eval_polls(drv, INFO_PROBE_PREFIX) == 3
+
+    def test_landing_turn_beats_the_breaker(self):
+        drv = ConsoleFakeDriver(share_tab=True)
+        drv.bubbles = ["q-已在\n13:40"]
+        assert console._wait_ownership(drv, "q-已在", 0, timeout=5.0,
+                                       poll=0.01, sleep=NOOP) is True
+        assert _eval_polls(drv, INFO_PROBE_PREFIX) == 1
+        assert drv.screenshots == []     # no failure evidence on the happy path
+
+    def test_ask_fails_fast_when_the_submit_never_lands(self, tmp_console_home):
+        drv = ConsoleFakeDriver(share_tab=True, no_progress=True)
+        with pytest.raises(ConsoleError) as exc:
+            _ask(drv, "q-永不进展")
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gate == "submit"
+        assert exc.value.evidence and exc.value.evidence.endswith(".png")
+        # bounded failure: a few dozen probes, not a spin to the timeout
+        assert len([c for c in drv.calls if c[0] == "evaluate"]) < 60
+
+    def test_normal_progress_is_never_tripped(self):
+        drv = ConsoleFakeDriver()
+        res = _ask(drv, "q-正常进展")
+        assert res["ok"] is True
+        assert res["gates"]["submit"]["ok"] is True
+        assert "no_progress" not in json.dumps(res["gates"], ensure_ascii=False)
+
+    def test_chip_wait_breaks_instead_of_idling_out_the_budget(self, tmp_path):
+        f = tmp_path / "chips-never.txt"
+        f.write_text("42", encoding="utf-8")
+        drv = ConsoleFakeDriver(share_tab=True, chips_never_appear=True)
+        with pytest.raises(ConsoleError) as exc:
+            # guard_min_elapsed=0 opts out of the slow-page grace to pin the
+            # pure fail-fast end (production defaults to a 5s grace)
+            console._gate_files(drv, [str(f)], sleep=NOOP, wait=30.0,
+                                guard_min_elapsed=0.0)
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gate == "file"
+        # chips0 pre-read + 3 frozen loop polls — never the 30s budget
+        assert _eval_polls(drv, CHIPS_PROBE_PREFIX) == 4
+
+    def test_chips_appearing_progresses_without_a_trip(self, tmp_path):
+        f = tmp_path / "chips-ok.txt"
+        f.write_text("42", encoding="utf-8")
+        drv = ConsoleFakeDriver(share_tab=True)
+        out = console._gate_files(drv, [str(f)], sleep=NOOP)
+        assert out["ok"] is True
+        assert out["chips"] == ["chips-ok.txt"]
+
+
+# ──────────────────────────────────────────────────────────────
+# ①: read-only probe drift report (console drift / selfcheck --drift)
+# ──────────────────────────────────────────────────────────────
+
+class RecordingDriftDriver(ConsoleFakeDriver):
+    """FakeDriver that keeps the FULL source of every executed probe."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.executed_sources = []
+
+    def evaluate(self, code, **kwargs):
+        self.executed_sources.append(code)
+        return super().evaluate(code, **kwargs)
+
+
+class TestDriftReport:
+
+    def test_report_covers_all_12_probes_and_stays_read_only(self,
+                                                             tmp_console_home):
+        drv = RecordingDriftDriver(share_tab=True)
+        drv.prose = ["答案 42。"]
+        rep = console.console_drift(drv)
+        assert rep["ok"] is True
+        assert rep["kind"] == "drift" and rep["locale"] == "zh"
+        assert [n for n, _ in console.DRIFT_PROBES][0] == "info"
+        assert set(rep["probes"]) == {n for n, _ in console.DRIFT_PROBES}
+        assert rep["counts"] == {"total": 12, "read": 7, "action": 5,
+                                 "executed": 7, "found_false": 0, "anomalies": 0}
+        for name, mode in console.DRIFT_PROBES:
+            entry = rep["probes"][name]
+            assert entry["mode"] == mode
+            if mode == "action":
+                # never executed, only statically checked
+                assert entry["executed"] is False
+                assert entry["markers_ok"] is True
+                assert entry["reason"]
+            else:
+                assert entry["executed"] is True
+                assert isinstance(entry["summary"], dict)
+        # strictly read-only: no click/fill/cdp/navigate, no state write
+        assert not [c for c in drv.calls
+                    if c[0] in ("click", "fill", "cdp", "navigate")]
+        assert len(drv.executed_sources) == 7
+        joined = "\n".join(drv.executed_sources)
+        for forbidden in (".click()", "dispatchEvent", "atob(", "scrollTop",
+                          "window.scrollTo", "insertText", "input.files",
+                          "localStorage", "pushState"):
+            assert forbidden not in joined, forbidden
+        assert not (tmp_console_home / "runs.jsonl").exists()
+
+    def test_found_false_is_marked_and_shape_drift_is_flagged(self):
+        class DriftFake(RecordingDriftDriver):
+            def evaluate(self, code, **kwargs):
+                if "cloneNode" in code:            # _JS_PROSE
+                    return {"found": True, "text": "", "raw": ""}
+                if "visibilityState" in code:       # _JS_VISIBILITY
+                    return {"visible": False, "visibilityState": "hidden",
+                            "hidden": True}
+                if "user-bubble" in code:           # _JS_INFO (before aria-haspopup)
+                    return super().evaluate(code, **kwargs)
+                if "aria-haspopup" in code:         # _JS_MODEL_BTN
+                    return {"found": False}
+                return super().evaluate(code, **kwargs)
+
+        drv = DriftFake(share_tab=True)
+        rep = console.console_drift(drv)
+        assert rep["ok"] is False
+        assert rep["probes"]["model_btn"]["found"] is False
+        assert "model_btn" in rep["missing_found"]
+        assert rep["counts"]["found_false"] == 1
+        assert "prose: found but text is empty" in rep["anomalies"]
+        assert any(a.startswith("visibility:") and "hidden" in a
+                   for a in rep["anomalies"])
+        assert rep["counts"]["anomalies"] == len(rep["anomalies"]) >= 2
+
+    def test_probe_failure_is_reported_not_raised(self):
+        class DeadBridge(RecordingDriftDriver):
+            def evaluate(self, code, **kwargs):
+                if "user-bubble" in code:
+                    raise RuntimeError("bridge down")
+                return super().evaluate(code, **kwargs)
+
+        rep = console.console_drift(DeadBridge(share_tab=True))
+        assert rep["ok"] is False
+        assert rep["probes"]["info"]["executed"] is False
+        assert "bridge down" in rep["probes"]["info"]["error"]
+        assert any(a.startswith("info: probe failed") for a in rep["anomalies"])
+        # the remaining probes still ran
+        assert rep["probes"]["prose"]["executed"] is True
+
+
+class TestCliDrift:
+
+    @staticmethod
+    def _payload(ok=True):
+        anomalies = [] if ok else ["prose: found but text is empty"]
+        return {"ok": ok, "kind": "drift", "locale": "zh",
+                "probes": {
+                    "info": {"mode": "read", "executed": True, "found": True,
+                             "summary": {"url": "https://www.perplexity.ai/",
+                                         "bubbles": 0}},
+                    "expand": {"mode": "action", "executed": False,
+                               "reason": "would click the expand control",
+                               "found": None, "markers": ["展开", "查看更多"],
+                               "markers_ok": True}},
+                "missing_found": [] if ok else ["prose"],
+                "anomalies": anomalies,
+                "counts": {"total": 12, "read": 7, "action": 5, "executed": 7,
+                           "found_false": 0 if ok else 1,
+                           "anomalies": len(anomalies)}}
+
+    def test_drift_json_output(self, monkeypatch, capsys):
+        payload = self._payload()
+        monkeypatch.setattr(console, "console_drift", lambda: payload)
+        args = build_parser().parse_args(["console", "drift", "-f", "json"])
+        rc = cmd_console(args)
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert out["ok"] is True
+        assert out["counts"]["total"] == 12
+
+    def test_drift_text_rendering(self, monkeypatch, capsys):
+        monkeypatch.setattr(console, "console_drift", lambda: self._payload())
+        args = build_parser().parse_args(["console", "drift"])
+        rc = cmd_console(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "drift report: 12 probes" in out
+        assert "action static-only" in out and "markers-ok" in out
+        assert "verdict: clean" in out
+
+    def test_selfcheck_drift_alias_runs_the_report(self, monkeypatch, capsys):
+        payload = self._payload()
+        monkeypatch.setattr(console, "console_drift", lambda: payload)
+        args = build_parser().parse_args(["console", "selfcheck",
+                                          "--drift", "-f", "json"])
+        rc = cmd_console(args)
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["kind"] == "drift"
+
+    def test_anomalies_exit_nonzero_and_are_printed(self, monkeypatch, capsys):
+        monkeypatch.setattr(console, "console_drift",
+                            lambda: self._payload(ok=False))
+        args = build_parser().parse_args(["console", "drift"])
+        rc = cmd_console(args)
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "missing_found: prose" in out
+        assert "⚠" in out
+
+    def test_bare_selfcheck_still_runs_the_canned_pipeline(self,
+                                                           monkeypatch, capsys):
+        ran, drifted = [], []
+
+        def fake_selfcheck(**kwargs):
+            ran.append(kwargs)
+            return {"ok": True, "answer": "答案", "gates": {"fill": {"ok": True}},
+                    "elapsed_s": 0.1}
+
+        def fake_drift(*args, **kwargs):
+            drifted.append(1)
+            return self._payload()
+
+        monkeypatch.setattr(console, "console_selfcheck", fake_selfcheck)
+        monkeypatch.setattr(console, "console_drift", fake_drift)
+        args = build_parser().parse_args(["console", "selfcheck"])
+        rc = cmd_console(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert len(ran) == 1 and drifted == []
+        assert "SELFCHECK PASSED" in out
+
+
+# ──────────────────────────────────────────────────────────────
+# ③: i18n-driven probe labels + the legacy expand rung
+# ──────────────────────────────────────────────────────────────
+
+class TestProbeLabels:
+
+    def test_expand_probe_matches_new_and_legacy_labels(self):
+        src = console._JS_EXPAND
+        assert "=== '展开'" in src            # new-UI exact match (test marker)
+        assert "查看更多" in src              # legacy rung
+        assert ".includes(" in src            # legacy match is `includes`
+
+    def test_chips_probe_uses_the_i18n_prefix(self):
+        src = console._JS_CHIPS
+        assert "'移除 '" in src
+        assert "PREFIX.length" in src         # no hard-coded slice(3)
+
+    def test_info_probe_uses_the_i18n_studied_label(self):
+        assert "'已研究'" in console._JS_INFO
+
+    def test_detach_label_comes_from_i18n(self):
+        import inspect
+        src = inspect.getsource(console.console_detach)
+        assert 'get_ui_string("remove_prefix"' in src
+
+    def test_default_locale_probe_matches_the_module_constant(self):
+        assert console._probe_locale() == "zh"
+        assert console._probe("expand") == console._JS_EXPAND
+        assert console._probe("chips") == console._JS_CHIPS
+        assert console._probe("info") == console._JS_INFO
+
+    def test_en_locale_builds_english_probes(self, monkeypatch):
+        monkeypatch.setattr(console.get_config(), "locale", "en")
+        assert console._probe_locale() == "en"
+        expand = console._probe("expand")
+        assert "'Expand'" in expand and "'Show more'" in expand
+        assert "展开" not in expand
+        assert "'Remove '" in console._probe("chips")
+        assert "'Researched'" in console._probe("info")
+
+
+# ──────────────────────────────────────────────────────────────
+# ④: expand-probe selection (legacy rung must never click questions)
+# executed against the REAL probe JS in node — the FakeDriver only
+# pattern-matches probe source, it cannot test the matcher itself.
+# ──────────────────────────────────────────────────────────────
+
+NODE = shutil.which("node")
+
+def _expand_probe_run(labels):
+    """Run the built expand probe in node over a stub DOM of buttons.
+
+    Returns ``{"out": <probe return value>, "clicked": [<labels clicked>]}``.
+    """
+    src = console._probe("expand")
+    assert NODE is not None
+    harness = (
+        "const clicked = [];\n"
+        "globalThis.document = { querySelectorAll: () => %s.map(t => "
+        "({innerText: t, click: () => clicked.push(t)})) };\n"
+        "const out = %s;\n"
+        "process.stdout.write(JSON.stringify({out: out, clicked: clicked}));\n"
+    ) % (json.dumps(labels, ensure_ascii=False), src)
+    proc = subprocess.run([NODE, "-e", harness], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required to execute probe JS")
+class TestExpandProbeSelection:
+    """A: exact label match first; the legacy `includes` rung is last resort."""
+
+    def test_legacy_exact_show_more_button_is_matched(self):
+        cases = [
+            (["查看更多"], "查看更多"),
+            (["怎么查看更多细节？", "查看更多"], "查看更多"),
+            (["旧按钮", "查看更多 "], "查看更多 "),  # trailing space: trimmed match
+            (["查看更多…"], "查看更多…"),            # noisy suffix: fallback rung
+            (["查看更多 »"], "查看更多 »"),
+        ]
+        for labels, expected in cases:
+            out = _expand_probe_run(labels)
+            assert out["out"] == "clicked", labels
+            assert out["clicked"] == [expected], labels
+
+    def test_question_button_with_show_more_substring_is_never_clicked(self):
+        # 「怎么查看更多细节？」 carries the legacy label as a substring but is
+        # a follow-up QUESTION — clicking it would fire a new turn inside the
+        # read-only extraction step. Must not be selected, alone or next to a
+        # real expand button.
+        for labels in (["怎么查看更多细节？"],
+                       ["查看更多细节？"],
+                       ["怎么查看更多细节？", "查看更多细节？"]):
+            out = _expand_probe_run(labels)
+            assert out["out"] == "none", labels
+            assert out["clicked"] == [], labels
+        out = _expand_probe_run(["怎么查看更多细节？", "展开"])
+        assert out["clicked"] == ["展开"]
+
+    def test_exact_match_beats_loose_candidates_and_new_ui_label_works(self):
+        out = _expand_probe_run(["展开", "查看更多"])
+        assert out["clicked"] == ["查看更多"]      # last exact match, DOM order
+        out = _expand_probe_run(["展开"])
+        assert out["out"] == "clicked" and out["clicked"] == ["展开"]
+        out = _expand_probe_run(["旧草稿"])
+        assert out["out"] == "none" and out["clicked"] == []
+
+
+# ──────────────────────────────────────────────────────────────
+# ⑤: _gate_submit terminal error accuracy (per-rung trip accounting)
+# ──────────────────────────────────────────────────────────────
+
+class FrozenThenMovingDriver(ConsoleFakeDriver):
+    """Wait 1 sees a frozen page (breaker trip); after the Enter-combo rung
+    the page keeps changing but the turn never lands (plain timeout)."""
+
+    def __init__(self, **kw):
+        super().__init__(share_tab=True, submit_disabled=True, **kw)
+        self.unfrozen = False
+        self._ticks = 0
+
+    def evaluate(self, code, **kwargs):
+        if "dispatchEvent" in code:
+            self.unfrozen = True
+        out = super().evaluate(code, **kwargs)
+        if self.unfrozen and "user-bubble" in code and isinstance(out, dict):
+            self._ticks += 1
+            out = dict(out)
+            out["lastProseLen"] = self._ticks * 7   # substantive change/poll
+        return out
+
+
+class TestGateSubmitTerminalErrors:
+    """C: the terminal error says which rung(s) really tripped, and carries
+    the `no_progress` breakdown in ``gates=``."""
+
+    def test_every_wait_tripped_reports_act_no_progress_with_detail(self):
+        drv = ConsoleFakeDriver(share_tab=True, submit_disabled=True)
+        with pytest.raises(ConsoleError) as exc:
+            console._gate_submit(drv, "q-全熔断", 0,
+                                 timeout=0.2, poll=0.01, sleep=NOOP)
+        assert exc.value.code == "act.no-progress"
+        assert "every wait tripped" in exc.value.message
+        np = exc.value.gates["submit"]["no_progress"]
+        assert np["rungs"] == {"button": "tripped", "combo": "tripped"}
+        assert np["tripped"] == ["button", "combo"]
+        assert np["detail"]["button"]["streak"] == 3
+        assert np["detail"]["combo"]["limit"] == 3
+
+    def test_mixed_trip_and_timeout_reports_submit_no_turn_honestly(self):
+        drv = FrozenThenMovingDriver()
+        with pytest.raises(ConsoleError) as exc:
+            console._gate_submit(drv, "q-混合", 0,
+                                 timeout=0.05, poll=0.01, sleep=NOOP)
+        # one rung tripped, the other timed out on a moving page: that is a
+        # plain no-turn, NOT act.no-progress
+        assert exc.value.code == "submit.no-turn"
+        assert "every wait tripped" not in exc.value.message
+        assert "button" in exc.value.message and "combo" in exc.value.message
+        np = exc.value.gates["submit"]["no_progress"]
+        assert np["rungs"] == {"button": "tripped", "combo": "timeout"}
+        assert np["tripped"] == ["button"]
+        assert np["detail"]["button"]["streak"] == 3
+
+    def test_plain_wait_timeout_still_reports_submit_no_turn(self):
+        # D(iii) regression pin: a NON-trip timeout must keep its own code
+        drv = FrozenThenMovingDriver()
+        with pytest.raises(ConsoleError) as exc:
+            console._gate_submit(drv, "q-普通超时", 0,
+                                 timeout=0.05, poll=0.01, sleep=NOOP)
+        assert exc.value.code == "submit.no-turn"
+        np = exc.value.gates["submit"]["no_progress"]
+        assert np["tripped"] == ["button"]     # only the frozen rung tripped
+        # and the pure no-trip case: both waits time out on a moving page
+        drv2 = FrozenThenMovingDriver()
+        drv2.unfrozen = True                   # moving from the very start
+        with pytest.raises(ConsoleError) as exc2:
+            console._gate_submit(drv2, "q-双超时", 0,
+                                 timeout=0.05, poll=0.01, sleep=NOOP)
+        assert exc2.value.code == "submit.no-turn"
+        assert exc2.value.gates["submit"]["no_progress"]["tripped"] == []
+        assert exc2.value.gates["submit"]["no_progress"]["rungs"] == {
+            "button": "timeout", "combo": "timeout"}
+
+    def test_recovery_failure_keeps_no_progress_detail_in_gates(self):
+        # the reload-recovery merge must not wipe the terminal no_progress detail
+        drv = ConsoleFakeDriver(share_tab=True, submit_disabled=True)
+        console_fill("q-恢复明细", config=make_config(), driver=drv, sleep=NOOP)
+        with pytest.raises(ConsoleError) as exc:
+            console._submit_with_recovery(
+                drv, make_config(), "q-恢复明细", 0, files=None,
+                submit_timeout=0.2, submit_recheck_timeout=0.05,
+                poll_interval=0.01, sleep=NOOP)
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gates["submit"]["no_progress"]["tripped"] == [
+            "button", "combo"]
+        assert "submit_first_error" in exc.value.gates
+
+
+# ──────────────────────────────────────────────────────────────
+# ⑥: breaker must not break the recovery chains (combo rung / delayed
+#    ownership / bridge-lost re-attach)
+# ──────────────────────────────────────────────────────────────
+
+class LateLandingDriver(ConsoleFakeDriver):
+    """The submitted turn becomes visible only after N post-submit info polls
+    (slow render) — the breaker sees a frozen page first."""
+
+    def __init__(self, land_after=9, **kw):
+        super().__init__(share_tab=True, **kw)
+        self.land_after = land_after
+        self._pending_query = None
+
+    def _submit(self):
+        if self._pending_query is None:
+            self._pending_query = self.composer.strip()
+
+    def evaluate(self, code, **kwargs):
+        if self._pending_query and "user-bubble" in code:
+            self.land_after -= 1
+            if self.land_after <= 0:
+                self.bubbles.append(self._pending_query + "\n13:40")
+                self._pending_query = None
+        return super().evaluate(code, **kwargs)
+
+
+def _record_wait_outcomes(monkeypatch):
+    """Wrap ``_wait_ownership`` to record verdicts/breaker trips per call."""
+    outcomes = []
+    real_wait = console._wait_ownership
+
+    def recording_wait(*args, **kwargs):
+        try:
+            out = real_wait(*args, **kwargs)
+            outcomes.append(out)
+            return out
+        except ConsoleError as exc:
+            outcomes.append(exc.code)
+            raise
+
+    monkeypatch.setattr(console, "_wait_ownership", recording_wait)
+    return outcomes
+
+
+class TestBreakerSafeRecoveryChains:
+    def test_combo_rung_sees_late_bubble_and_succeeds(self, monkeypatch):
+        # D(i): first (button) wait trips → Enter-combo rung fires → second
+        # wait sees the late bubble → success must NOT be misjudged as failure
+        outcomes = _record_wait_outcomes(monkeypatch)
+        drv = ConsoleFakeDriver(share_tab=True, button_submit_works=False)
+        console_fill("q-晚到", config=make_config(), driver=drv, sleep=NOOP)
+        res = console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                             submit_timeout=0.3, submit_recheck_timeout=0.3,
+                             poll_interval=0.01)
+        assert res["ok"] is True
+        assert res["gates"]["submit"]["mechanism"] == "combo"
+        assert outcomes == ["act.no-progress", True]
+        assert len(drv.bubbles) == 1
+
+    def test_delayed_ownership_recheck_recovers_after_a_trip(self, monkeypatch):
+        # D(ii): both rungs trip (turn lands late) → the delayed-ownership
+        # recheck inside _submit_with_recovery still wins → no reload retry,
+        # no double send, no exception
+        outcomes = _record_wait_outcomes(monkeypatch)
+        drv = LateLandingDriver(land_after=9)
+        console_fill("q-延迟归属", config=make_config(), driver=drv, sleep=NOOP)
+        res = console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                             submit_timeout=0.3, submit_recheck_timeout=0.3,
+                             poll_interval=0.01)
+        assert res["ok"] is True
+        assert res["gates"]["submit"]["mechanism"] == "delayed-ownership"
+        assert res["gates"]["submit"].get("recovered") is None
+        assert outcomes == ["act.no-progress", "act.no-progress", True]
+        assert len(drv.bubbles) == 1          # anti-double-send: one turn only
+
+    def test_bridge_lost_reattach_breaker_trip_falls_back_to_bounded_retry(
+            self, monkeypatch):
+        # B / D(iv): bridge lost mid-flight → re-attach → ownership recheck
+        # trips the breaker → treated as "not confirmed sent" and the ORIGINAL
+        # bounded retry runs — the breaker must not escape as a hard failure
+        drv = ConsoleFakeDriver(share_tab=True)
+        console_fill("hi-重挂", config=make_config(), driver=drv, sleep=NOOP)
+
+        real_gate = console._gate_submit
+        gate_calls = []
+
+        def bridge_lost_once(*args, **kwargs):
+            gate_calls.append(1)
+            if len(gate_calls) == 1:
+                raise ConsoleError("attach", "bridge lost mid-flight",
+                                   code="attach.bad-response")
+            return real_gate(*args, **kwargs)
+
+        monkeypatch.setattr(console, "_gate_submit", bridge_lost_once)
+
+        opened = []
+        monkeypatch.setattr(
+            console, "console_open",
+            lambda target, **kw: opened.append(target) or {"ok": True,
+                                                           "target": target})
+        outcomes = _record_wait_outcomes(monkeypatch)
+
+        res = console_submit(config=make_config(), driver=drv, sleep=NOOP,
+                             submit_timeout=0.3, submit_recheck_timeout=0.3,
+                             poll_interval=0.01)
+        assert res["ok"] is True
+        assert res["reattached"] is True
+        assert opened == ["default"]          # bounded: exactly one re-attach
+        # the recheck really tripped (act.no-progress → treated as "not
+        # sent") and the bounded retry's wait then confirmed the send
+        assert outcomes == ["act.no-progress", True]
+        assert len(gate_calls) == 2           # …and the readback retried once
+        assert len(drv.bubbles) == 1          # double-send guard: one turn only
+
+
+# ──────────────────────────────────────────────────────────────
+# ⑦: chip-wait slow-page grace (min_elapsed floor on the breaker)
+# ──────────────────────────────────────────────────────────────
+
+class TestChipWaitGrace:
+    def test_min_elapsed_floor_holds_the_streak_back(self):
+        guard = console.NoProgressGuard(gate="file", min_elapsed=5.0)
+        frozen = {"attachments": [], "missing": ["a.txt"]}
+        for _ in range(6):
+            guard.observe(dict(frozen))     # all inside the 5s grace window
+        assert guard.samples == 6
+        assert guard.streak == 0            # nothing counted yet
+
+    def test_slow_chips_are_not_cut_off_by_the_breaker(self, tmp_path):
+        f = tmp_path / "chips-slow.txt"
+        f.write_text("42", encoding="utf-8")
+        # chips surface only at chip-poll 7 — after more frozen polls than
+        # NO_PROGRESS_LIMIT. The 5s grace keeps the breaker off long enough.
+        drv = ConsoleFakeDriver(share_tab=True, chips_appear_after=6)
+        out = console._gate_files(drv, [str(f)], sleep=NOOP, wait=30.0)
+        assert out["ok"] is True
+        assert out["chips"] == ["chips-slow.txt"]
+
+    def test_same_script_trips_without_the_grace(self, tmp_path):
+        f = tmp_path / "chips-fastfail.txt"
+        f.write_text("42", encoding="utf-8")
+        drv = ConsoleFakeDriver(share_tab=True, chips_appear_after=6)
+        with pytest.raises(ConsoleError) as exc:
+            console._gate_files(drv, [str(f)], sleep=NOOP, wait=30.0,
+                                guard_min_elapsed=0.0)
+        assert exc.value.code == "act.no-progress"
+        assert exc.value.gate == "file"

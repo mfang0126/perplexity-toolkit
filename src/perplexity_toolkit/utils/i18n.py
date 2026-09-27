@@ -11,6 +11,9 @@ UI_STRINGS = {
         "sources_tab": "链接",
         "images_tab": "图片",
         "search_results": "搜索结果",
+        "studied": "已研究",
+        "expand": "展开",
+        "remove_prefix": "移除 ",
     },
     "en": {
         "deep_research": "Deep Research",
@@ -22,6 +25,9 @@ UI_STRINGS = {
         "sources_tab": "Sources",
         "images_tab": "Images",
         "search_results": "Search results",
+        "studied": "Researched",   # NOTE: en labels are NOT live-verified on the English site
+        "expand": "Expand",
+        "remove_prefix": "Remove ",
     },
 }
 

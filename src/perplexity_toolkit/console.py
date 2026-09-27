@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import mimetypes
@@ -50,6 +51,7 @@ from typing import Any, Callable, Optional
 
 from . import console_judge
 from .config import Config, get_config
+from .utils.i18n import get_ui_string
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,12 @@ POLL_INTERVAL = 3.0           # seconds between completion samples
 SUBMIT_TIMEOUT = 15.0         # seconds to observe the new user turn
 FILL_SETTLE = 0.7             # seconds after a fill/CDP insert before readback
 SELFCHECK_QUERY = "用一句话回答：1+1 等于几？"
+
+# Circuit breaker for polling/wait loops: N consecutive samples with zero
+# substantive progress fail the step early instead of spinning to the
+# timeout (lesson: a repeated action that "keeps doing something" only
+# because the page wiggled by a sub-pixel must never look like progress).
+NO_PROGRESS_LIMIT = 3
 
 
 SUBMIT_ICON_IDLE = "#pplx-icon-arrow-up"   # live-verified idle action icon (2026-09-23)
@@ -100,7 +108,7 @@ def _answer_settled(info: dict, prev_len: int, stable: int, *, new_seen: bool) -
 # "a[href]", '提交', 'dispatchEvent', "=== '展开'").
 # ──────────────────────────────────────────────────────────────
 
-_JS_INFO = r"""(() => {
+_JS_INFO_TMPL = r"""(() => {
   const btns = Array.from(document.querySelectorAll('button'));
   const bubbles = Array.from(document.querySelectorAll('[class*="user-bubble"]'))
     .filter(el => !String(el.className || '').includes('opacity-0'));
@@ -133,7 +141,7 @@ _JS_INFO = r"""(() => {
     )].some(b => (b.checkVisibility?.() ?? b.offsetParent !== null)),
     bubbles: bubbles.length,
     lastBubble: bubbles.length ? String(bubbles[bubbles.length - 1].innerText || '').slice(0, 300) : '',
-    studied: btns.filter(b => String(b.innerText || '').includes('已研究')).length,
+    studied: btns.filter(b => String(b.innerText || '').includes(__STUDIED__)).length,
     generating: /正在|思考中|generating/i.test(document.body.textContent || ''),
     proseCount: prose.length,
     lastProseLen: prose.length ? String(prose[prose.length - 1].innerText || '').length : 0
@@ -214,11 +222,23 @@ _JS_ENTER_COMBO = r"""(() => {
   return 'enter dispatched';
 })()"""
 
-_JS_EXPAND = r"""(() => {
+_JS_EXPAND_TMPL = r"""(() => {
   const btns = Array.from(document.querySelectorAll('button'))
-    .filter(b => String(b.innerText || '').trim() === '展开');
-  if (!btns.length) return 'none';
-  btns[btns.length - 1].click();
+    .map(b => [b, String(b.innerText || '').trim()]);
+  // Exact label match wins (trim + ===). The legacy includes() rung is a
+  // LAST-RESORT fallback: it only fires when NO exact match exists AND the
+  // button text is essentially just the label (<=2 chars of icon/punctuation
+  // noise, no question mark), so question buttons carrying the label as a
+  // substring (e.g. the follow-up 「怎么查看更多细节？」) are never clicked —
+  // clicking them would submit a question inside a read-only extraction step.
+  const near = (t, lab) => t.includes(lab) && t.length - lab.length <= 2
+                           && !/[？?]/.test(t);
+  const exact = btns.filter(([b, t]) => t === __EXPAND__ || t === __LEGACY__);
+  const loose = exact.length ? []
+    : btns.filter(([b, t]) => near(t, __EXPAND__) || near(t, __LEGACY__));
+  const pool = exact.length ? exact : loose;
+  if (!pool.length) return 'none';
+  pool[pool.length - 1][0].click();
   return 'clicked';
 })()"""
 
@@ -255,11 +275,12 @@ _JS_MODEL_MENU = r"""(() => {
   return JSON.stringify({open: true, rows: rows});
 })()"""
 
-_JS_CHIPS = r"""(() => {
+_JS_CHIPS_TMPL = r"""(() => {
+  const PREFIX = __PREFIX__;
   const labels = Array.from(document.querySelectorAll('button'))
     .map(b => b.getAttribute('aria-label') || '')
-    .filter(a => a.indexOf('移除 ') === 0)
-    .map(a => a.slice(3));
+    .filter(a => a.indexOf(PREFIX) === 0)
+    .map(a => a.slice(PREFIX.length));
   return JSON.stringify({attachments: labels});
 })()"""
 
@@ -275,6 +296,71 @@ _JS_INJECT_FILE = r"""(() => {
   input.dispatchEvent(new Event('change', {bubbles: true}));
   return JSON.stringify({ok: true, count: input.files.length, size: arr.length});
 })()"""
+
+
+# ──────────────────────────────────────────────────────────────
+# Locale-aware probe assembly
+#
+# Three probes embed UI text (studied pill / expand control / attachment-chip
+# aria-label prefix); the rest are locale-neutral. Those three are built from
+# utils.i18n so an `en` console matches the English UI, and with the default
+# locale (zh) the INJECTED LITERALS reproduce the historical source byte for
+# byte — the marker strings the tests/FakeDriver dispatch on (=== '展开', 移除 ,
+# 已研究) survive verbatim. The probe source AS A WHOLE is not byte-identical
+# to the historical constants: `_JS_CHIPS` is only semantically equivalent
+# (PREFIX-based slicing instead of the old hard-coded slice(3)) and
+# `_JS_EXPAND`'s legacy rung was tightened (exact label match first).
+# `_probe(name)` re-resolves the locale on every call; the module
+# level `_JS_*` constants are the import-time binding kept for introspection
+# and the drift report's static checks.
+# ──────────────────────────────────────────────────────────────
+
+def _js_str(value: Any) -> str:
+    """Single-quoted JS string literal (keeps the historical `=== '展开'` shape)."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _probe_locale() -> str:
+    """Active UI locale for label-bearing probes ('zh' unless configured)."""
+    try:
+        return get_config().locale or "zh"
+    except Exception:  # noqa: BLE001 — a broken config must never break probing
+        return "zh"
+
+
+def _build_info(locale: str) -> str:
+    return _JS_INFO_TMPL.replace("__STUDIED__", _js_str(get_ui_string("studied", locale)))
+
+
+def _build_expand(locale: str) -> str:
+    # new-UI label (exact match) + legacy rung 「查看更多」 — exact match
+    # first, `includes` only as a last resort when no exact match exists
+    # (see _JS_EXPAND_TMPL), mirroring skills/perplexity-web-automation/SKILL.md.
+    return (_JS_EXPAND_TMPL
+            .replace("__EXPAND__", _js_str(get_ui_string("expand", locale)))
+            .replace("__LEGACY__", _js_str(get_ui_string("show_more", locale))))
+
+
+def _build_chips(locale: str) -> str:
+    return _JS_CHIPS_TMPL.replace("__PREFIX__", _js_str(get_ui_string("remove_prefix", locale)))
+
+
+_PROBE_BUILDERS: dict = {"info": _build_info, "expand": _build_expand, "chips": _build_chips}
+_PROBE_CACHE: dict = {}
+
+
+def _probe(name: str) -> str:
+    """Source of probe ``name`` for the CURRENT locale (cached per locale)."""
+    locale = _probe_locale()
+    key = (name, locale)
+    if key not in _PROBE_CACHE:
+        _PROBE_CACHE[key] = _PROBE_BUILDERS[name](locale)
+    return _PROBE_CACHE[key]
+
+
+_JS_INFO = _probe("info")
+_JS_EXPAND = _probe("expand")
+_JS_CHIPS = _probe("chips")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -526,7 +612,7 @@ def _js(driver: Any, code: str, default: Any = None, *, mutating: bool = True) -
 
 
 def _info(driver: Any) -> dict:
-    value = _js(driver, _JS_INFO, {}, mutating=False)
+    value = _js(driver, _probe("info"), {}, mutating=False)
     return value if isinstance(value, dict) else {}
 
 
@@ -561,6 +647,109 @@ def _evidence(driver: Any) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001 — evidence must never mask the gate
         logger.debug("evidence screenshot failed: %s", exc)
         return None
+
+
+# ──────────────────────────────────────────────────────────────
+# No-progress circuit breaker (repeated-action guard)
+# ──────────────────────────────────────────────────────────────
+
+# Pure geometry / scroll offsets. Sub-pixel layout jitter on a page that is
+# otherwise frozen must never read as progress — that is exactly the failure
+# this guard exists to catch (an agent re-firing the same action dozens of
+# times because "something changed" when only a rect wiggled).
+_NO_PROGRESS_NOISE_KEYS = frozenset({
+    "x", "y", "cx", "cy", "sx", "sy", "left", "right", "width", "height",
+    "rect", "bounding", "scrolltop", "scrollleft", "scrollheight",
+    "clientheight", "clientwidth", "offsetwidth", "offsetheight",
+})
+
+
+def _strip_noise(value: Any) -> Any:
+    """Recursively drop geometry keys so only substantive signals remain."""
+    if isinstance(value, dict):
+        return {k: _strip_noise(v) for k, v in value.items()
+                if str(k).lower() not in _NO_PROGRESS_NOISE_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [_strip_noise(v) for v in value]
+    return value
+
+
+def _progress_signature(sample: Any) -> str:
+    """Digest of the substantive progress signals in one poll sample.
+
+    Everything except the geometry noise keys survives, so URL, bubble count
+    and text, prose length/hash, studied-pill count, attachment chips and the
+    presence of busy/target controls all count as progress; rect/pixel jitter
+    does not.
+    """
+    blob = json.dumps(_strip_noise(sample), sort_keys=True,
+                      ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+class NoProgressGuard:
+    """Circuit breaker for polling/wait loops.
+
+    Feed every poll sample to :meth:`observe`. When ``limit`` consecutive
+    samples carry an identical progress signature the guard raises
+    ``ConsoleError(code="act.no-progress")`` so the loop fails fast instead
+    of spinning to its timeout on a page that is not moving. Callers that
+    have their own recovery rung (or their own terminal error code) catch
+    that code and decide what to do next.
+    """
+
+    def __init__(self, *, gate: str, limit: int = NO_PROGRESS_LIMIT,
+                 driver: Any = None, what: str = "poll",
+                 min_elapsed: float = 0.0) -> None:
+        self.gate = gate
+        self.limit = max(int(limit), 1)
+        self.driver = driver
+        self.what = what
+        # Slow-page grace: samples observed within `min_elapsed` seconds of
+        # the guard's first sample never count towards the streak, so a wait
+        # with a long budget tolerates slow renders without weakening
+        # fail-fast on a page that is frozen from the start (which still
+        # trips `limit` polls after the grace window).
+        self.min_elapsed = max(float(min_elapsed), 0.0)
+        self.samples = 0
+        self.streak = 0
+        self._last: Optional[str] = None
+        self._started: Optional[float] = None
+
+    def reset(self) -> None:
+        self.samples = 0
+        self.streak = 0
+        self._last = None
+        self._started = None
+
+    def observe(self, sample: Any) -> None:
+        """Record one sample; raise ``act.no-progress`` on a frozen run."""
+        signature = _progress_signature(sample)
+        self.samples += 1
+        if self._started is None:
+            self._started = time.monotonic()
+        if self.min_elapsed and time.monotonic() - self._started < self.min_elapsed:
+            # grace window: slow pages may legitimately show nothing yet
+            self._last = signature
+            self.streak = 0
+            return
+        if self._last is not None and signature == self._last:
+            self.streak += 1
+        else:
+            self.streak = 1
+        self._last = signature
+        if self.streak < self.limit:
+            return
+        raise ConsoleError(
+            self.gate,
+            f"连续 {self.streak} 次{self.what}无实质进展（状态完全未变），提前熔断"
+            f" / no substantive progress in {self.streak} consecutive {self.what}s"
+            f" (signal {signature[:12]}); verify the tab before retrying",
+            gates={self.gate: {"ok": False, "no_progress": {
+                "streak": self.streak, "limit": self.limit,
+                "samples": self.samples, "signature": signature[:12]}}},
+            evidence=_evidence(self.driver) if self.driver is not None else None,
+            code="act.no-progress")
 
 
 def _cdp_click(driver: Any, x: int, y: int, *, sleep: Callable[[float], None]) -> None:
@@ -696,16 +885,47 @@ def _composer(driver: Any) -> str:
 def _wait_ownership(driver: Any, query: str, base_bubbles: int, *,
                     timeout: float, poll: float,
                     sleep: Callable[[float], None]) -> bool:
-    """Gate 2 core: a new user turn OWNING this query must appear."""
+    """Gate 2 core: a new user turn OWNING this query must appear.
+
+    Carries the no-progress circuit breaker: when ``NO_PROGRESS_LIMIT``
+    consecutive polls show a byte-identical substantive signal (URL, bubble
+    count/text, composer, studied pills, prose, busy controls — geometry
+    noise stripped) the wait raises ``act.no-progress`` instead of burning
+    the whole timeout on a frozen page. Ownership is checked BEFORE the
+    guard observes, so a landing turn always wins over the breaker.
+    """
+    guard = NoProgressGuard(gate="submit", driver=driver, what="poll")
     deadline = time.monotonic() + timeout
     while True:
         info = _info(driver)
         if (int(info.get("bubbles") or 0) > base_bubbles
                 and _bubble_owns(info.get("lastBubble") or "", query)):
             return True
+        guard.observe(info)
         if time.monotonic() >= deadline:
             return False
         sleep(max(poll, 0.05))
+
+
+def _ownership_or_exhausted(driver: Any, query: str, base_bubbles: int, *, timeout: float,
+                            poll: float, sleep: Callable[[float], None]) -> tuple:
+    """``_wait_ownership`` with the breaker translated to a plain verdict.
+
+    Returns ``(owned, tripped, no_progress)``: ``tripped=True`` means the wait
+    ended on ``act.no-progress`` (nothing moved at all), which is "not owned
+    yet" for callers that still have a recovery rung to try; ``no_progress``
+    is the breaker's detail dict (streak/limit/samples/signature) for that
+    trip, or ``None`` when the wait ended without tripping. Exceptions other
+    than the breaker propagate untouched.
+    """
+    try:
+        return _wait_ownership(driver, query, base_bubbles, timeout=timeout,
+                               poll=poll, sleep=sleep), False, None
+    except ConsoleError as exc:
+        if exc.code != "act.no-progress":
+            raise
+        detail = ((exc.gates or {}).get(exc.gate) or {}).get("no_progress")
+        return False, True, detail
 
 
 def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
@@ -751,20 +971,58 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
         retry = _js(driver, _JS_CLICK_SUBMIT, "no-button")
         actions.append({"action": "click-submit-button-retry", "result": retry})
         clicked = retry
-    if _wait_ownership(driver, query, base_bubbles, timeout=timeout, poll=poll, sleep=sleep):
+    # Both ownership waits run under the no-progress circuit breaker: a frozen
+    # page ends them early (act.no-progress) instead of idling out the timeout.
+    # The breaker means "nothing moved at all", so the Enter-combo rung still
+    # gets its turn; only when every rung has been tried does the gate fail.
+    # Trips are recorded PER RUNG: the terminal error must say which waits
+    # actually tripped instead of blaming "every wait" when only one did.
+    trips: list = []  # [(rung, breaker detail | None), ...]
+    owned, tripped, np_detail = _ownership_or_exhausted(
+        driver, query, base_bubbles, timeout=timeout, poll=poll, sleep=sleep)
+    trips.append(("button", np_detail if tripped else None))
+    if owned:
         mechanism = "button" if "clicked" in str(clicked) else "unexpected-none"
         return {"ok": True, "mechanism": mechanism, "actions": actions}
 
     combo = _js(driver, _JS_ENTER_COMBO, "no input")
     actions.append({"action": "enter-combo", "result": combo})
-    if _wait_ownership(driver, query, base_bubbles, timeout=timeout, poll=poll, sleep=sleep):
+    owned, tripped, np_detail = _ownership_or_exhausted(
+        driver, query, base_bubbles, timeout=timeout, poll=poll, sleep=sleep)
+    trips.append(("combo", np_detail if tripped else None))
+    if owned:
         return {"ok": True, "mechanism": "combo", "actions": actions}
 
     last = _info(driver).get("lastBubble") or ""
+    detail = f"no new user turn observed after submit attempts (last bubble: {str(last)[:80]!r})"
+    tripped_rungs = [rung for rung, np in trips if np is not None]
+    no_progress = {
+        "limit": NO_PROGRESS_LIMIT,
+        "rungs": {rung: ("tripped" if np is not None else "timeout")
+                  for rung, np in trips},
+        "tripped": tripped_rungs,
+        "detail": {rung: np for rung, np in trips if np is not None},
+    }
+    gates = {"submit": {"ok": False, "no_progress": no_progress}}
+    if len(tripped_rungs) == len(trips):
+        raise ConsoleError(
+            "submit",
+            f"{detail} — and every wait tripped the no-progress breaker "
+            f"(zero substantive change across {NO_PROGRESS_LIMIT} polls)",
+            gates=gates, evidence=_evidence(driver), code="act.no-progress")
+    if tripped_rungs:
+        waited = " and ".join(r for r, _ in trips if r not in tripped_rungs)
+        raise ConsoleError(
+            "submit",
+            f"{detail} — the {' and '.join(tripped_rungs)} wait(s) tripped the "
+            f"no-progress breaker (zero substantive change across "
+            f"{NO_PROGRESS_LIMIT} polls) while the {waited} wait timed out with "
+            f"the page still moving",
+            gates=gates, evidence=_evidence(driver), code="submit.no-turn")
     raise ConsoleError(
-        "submit",
-        f"no new user turn observed after submit attempts (last bubble: {str(last)[:80]!r})",
-        evidence=_evidence(driver), code="submit.no-turn")
+        "submit", f"{detail} — both waits timed out without tripping the "
+        f"no-progress breaker (the page kept moving but the turn never landed)",
+        gates=gates, evidence=_evidence(driver), code="submit.no-turn")
 
 
 def _gate_complete(driver: Any, base_studied: int, *,
@@ -1072,14 +1330,22 @@ def _inject_file(driver: Any, path: str) -> dict:
 
 
 def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
-                wait: float = 30.0, poll: float = 1.0) -> dict:
+                wait: float = 30.0, poll: float = 1.0,
+                guard_min_elapsed: float = 5.0) -> dict:
     """Gate: every requested file must be attached AND shown as a chip.
 
     Idempotent: files already present as chips are skipped, so injecting the
     same set twice (e.g. attach-then-fill, or a recovery re-run) never
     duplicates attachments.
+
+    The chip wait carries the no-progress breaker with a ``guard_min_elapsed``
+    slow-page grace: chips can legitimately take seconds to surface after a
+    large upload, so samples in the first ``guard_min_elapsed`` seconds never
+    count towards the streak. Without it the breaker would cut the effective
+    chip tolerance from the full ``wait`` budget down to ~3 polls (~6s).
+    Pass ``guard_min_elapsed=0.0`` to restore pure fail-fast.
     """
-    chips0 = _js(driver, _JS_CHIPS, {})
+    chips0 = _js(driver, _probe("chips"), {})
     current = chips0.get("attachments") if isinstance(chips0, dict) else []
     injected = []
     for f in files:
@@ -1092,11 +1358,18 @@ def _gate_files(driver: Any, files: list, *, sleep: Callable[[float], None],
     names = [i["name"] for i in injected]
     deadline = time.monotonic() + wait
     chips: Any = []
+    guard = NoProgressGuard(gate="file", driver=driver, what="chip-poll",
+                            min_elapsed=guard_min_elapsed)
     while True:
-        payload = _js(driver, _JS_CHIPS, {})
+        payload = _js(driver, _probe("chips"), {})
         chips = payload.get("attachments") if isinstance(payload, dict) else []
         if all(n in (chips or []) for n in names):
             break
+        # Every newly surfaced chip counts as progress; a chip list that is
+        # frozen for NO_PROGRESS_LIMIT polls (past the slow-page grace) trips
+        # the breaker instead of idling out the full `wait` budget.
+        guard.observe({"attachments": chips,
+                       "missing": [n for n in names if n not in (chips or [])]})
         if time.monotonic() >= deadline:
             raise ConsoleError("file", f"attachment chips not verified for {names} (saw {chips})",
                                evidence=_evidence(driver), code="file.chip-missing")
@@ -1224,9 +1497,13 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
         if submit_exc.gate != "submit":
             raise
         # First, give a slow/duplicated ownership read one more chance so a
-        # late-but-correct turn never gets sent twice.
-        if _wait_ownership(drv, query, base_bubbles, timeout=submit_recheck_timeout,
-                           poll=poll_interval, sleep=sleep):
+        # late-but-correct turn never gets sent twice. A breaker trip here
+        # means the page is frozen (nothing to duplicate) — treat it as
+        # "not owned" and continue to the reload recovery below.
+        late_owned, _, _ = _ownership_or_exhausted(
+            drv, query, base_bubbles, timeout=submit_recheck_timeout,
+            poll=poll_interval, sleep=sleep)
+        if late_owned:
             return {"ok": True, "mechanism": "delayed-ownership",
                     "actions": [{"action": "late-ownership", "result": "ok"}]}
         # Bounded recovery: a mis-sent state (e.g. file-only submission /
@@ -1248,7 +1525,10 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
             result["recovered"] = "reload"
             return result
         except ConsoleError as exc2:
-            merge = {"submit_first_error": {"message": submit_exc.message,
+            # keep the terminal gate's own detail (e.g. the per-rung
+            # no_progress breakdown) alongside the recovery context
+            merge = {**(exc2.gates or {}),
+                     "submit_first_error": {"message": submit_exc.message,
                                             "evidence": submit_exc.evidence}}
             if files_retry is not None:
                 merge["files_retry"] = files_retry
@@ -1326,7 +1606,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
     """
     gates = gates_out if gates_out is not None else {}
 
-    expand = _js(drv, _JS_EXPAND, "none")
+    expand = _js(drv, _probe("expand"), "none")
     if expand == "clicked":
         sleep(1.0)
     gates["expand"] = expand
@@ -1349,7 +1629,7 @@ def _extract_step(drv: Any, state: dict, cfg: Config, *,
 
     file_names = list((pending or {}).get("files") or [])
     if file_names:
-        payload = _js(drv, _JS_CHIPS, {}, mutating=False)
+        payload = _js(drv, _probe("chips"), {}, mutating=False)
         remaining = payload.get("attachments") if isinstance(payload, dict) else []
         gates["send"] = {"chips_cleared": not any(n in (remaining or []) for n in file_names)}
 
@@ -1661,14 +1941,18 @@ def console_submit(*, config: Optional[Config] = None, driver: Any = None,
             state = load_state()
             if exc.code != "pending.page-moved":
                 # bridge lost mid-flight: send state unknown — verify FIRST,
-                # never replay a submit that already landed
+                # never replay a submit that already landed. The ownership
+                # recheck is an anti-double-send BOOLEAN contract, so the
+                # no-progress breaker must not escape here: a trip only means
+                # ownership could not be confirmed ("not sent" for this
+                # check) and falls into the original bounded retry below.
                 p2 = _pending(state) or {}
                 q = p2.get("query")
-                sent = bool(p2.get("submitted_at")) or (
-                    bool(q) and _wait_ownership(
-                        drv, q, int(p2.get("base_bubbles") or 0),
-                        timeout=submit_recheck_timeout, poll=poll_interval,
-                        sleep=sleep))
+                owned, _, _ = _ownership_or_exhausted(
+                    drv, q or "", int(p2.get("base_bubbles") or 0),
+                    timeout=submit_recheck_timeout, poll=poll_interval,
+                    sleep=sleep)
+                sent = bool(p2.get("submitted_at")) or (bool(q) and owned)
                 if sent:
                     if not p2.get("submitted_at"):
                         p2["submitted_at"] = _now_iso()
@@ -1845,13 +2129,13 @@ def console_detach(name: str, *, config: Optional[Config] = None, driver: Any = 
     code = ("""(() => { const removeBtn = Array.from(document.querySelectorAll('button'))"""
             """.find(b => (b.getAttribute('aria-label') || '') === __LABEL__); """
             """if (!removeBtn) return 'not-found'; removeBtn.click(); return 'clicked'; })()"""
-            ).replace("__LABEL__", json.dumps(f"移除 {name}"))
+            ).replace("__LABEL__", json.dumps(get_ui_string("remove_prefix", _probe_locale()) + name))
     result = _js(drv, code, "not-found")
     if result != "clicked":
         raise ConsoleError("file", f"attachment {name!r} not found as a chip",
                            code="file.chip-missing")
     sleep(1.0)
-    chips = _js(drv, _JS_CHIPS, {}, mutating=False)
+    chips = _js(drv, _probe("chips"), {}, mutating=False)
     remaining = chips.get("attachments") if isinstance(chips, dict) else []
     if name in (remaining or []):
         raise ConsoleError("file", f"attachment {name!r} still present after remove",
@@ -1874,7 +2158,7 @@ def console_files(*, config: Optional[Config] = None, driver: Any = None,
     state = load_state()
     drv = driver or _make_driver(cfg, state)
     _ensure_console_tab(drv, state, cfg=cfg, sleep=sleep)
-    chips = _js(drv, _JS_CHIPS, {}, mutating=False)
+    chips = _js(drv, _probe("chips"), {}, mutating=False)
     attachments = chips.get("attachments") if isinstance(chips, dict) else []
     pending = _pending(state)
     return {"ok": True, "chips": attachments,
@@ -1925,6 +2209,194 @@ def console_threads() -> dict:
         "active_task": state.get("active_task"),
         "threads": state.get("threads") or {},
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# Read-only probe drift report
+# (`perplexity console drift` / `perplexity console selfcheck --drift`)
+# ──────────────────────────────────────────────────────────────
+
+# The 12 `_JS_*` probes, in source order, tagged read (safe to execute) or
+# action (would click / type / scroll / inject a file). A read-only selfcheck
+# must never fire an action probe: `_JS_CLICK_SUBMIT` literally submits a
+# message, `_JS_ENTER_COMBO` types Enter, `_JS_EXPAND` clicks and
+# `_JS_INJECT_FILE` is an uninstantiated template anyway.
+DRIFT_PROBES: tuple = (
+    ("info", "read"),
+    ("prose", "read"),
+    ("scroll", "action"),
+    ("sources", "read"),
+    ("click_submit", "action"),
+    ("enter_combo", "action"),
+    ("expand", "action"),
+    ("model_btn", "read"),
+    ("visibility", "read"),
+    ("model_menu", "read"),
+    ("chips", "read"),
+    ("inject_file", "action"),
+)
+
+DRIFT_STATIC_REASONS: dict = {
+    "scroll": "would scroll the page (mutating probe)",
+    "click_submit": "would click the submit control",
+    "enter_combo": "would dispatch Enter to the composer",
+    "expand": "would click the expand control",
+    "inject_file": "would inject a file into the composer (template: __B64__)",
+}
+
+_DRIFT_STATIC_MARKERS: dict = {
+    "scroll": ("overflowY", "scrollingElement"),
+    "click_submit": ('aria-label="提交"', ".click()"),
+    "enter_combo": ("dispatchEvent", "Enter"),
+    "inject_file": ("input[type=file]", "__B64__"),
+}
+
+
+def _drift_source(name: str) -> str:
+    """Source of probe ``name`` (``info``/``expand``/``chips`` are locale-built)."""
+    if name in _PROBE_BUILDERS:
+        return _probe(name)
+    return globals()["_JS_" + name.upper()]
+
+
+def _drift_markers(name: str, locale: str) -> tuple:
+    """Expected selectors/labels for a static (unexecuted) probe check."""
+    if name == "expand":
+        return (get_ui_string("expand", locale), get_ui_string("show_more", locale))
+    return _DRIFT_STATIC_MARKERS.get(name, ())
+
+
+def _drift_static_found(name: str, probes: dict) -> Optional[bool]:
+    """Read-only `found` for an action probe, derived from an executed probe."""
+    if name == "click_submit":
+        button = (probes.get("info") or {}).get("summary") or {}
+        state = button.get("submit_button")
+        return None if state is None else state != "missing"
+    return None
+
+
+def _drift_summary(name: str, value: Any) -> tuple:
+    """One executed probe -> ``(summary, found, anomalies)``.
+
+    ``found`` reports whether the probe's target structure was present in the
+    DOM (prose/model control/valid payload); ``anomalies`` flags anchor counts
+    that do not match the shape the probe was written against.
+    """
+    if name == "info":
+        if not isinstance(value, dict) or not value:
+            return {"payload": value}, None, ["empty payload"]
+        notes = []
+        if not value.get("url"):
+            notes.append("url is empty")
+        if value.get("submit_button") == "missing":
+            notes.append("submit control not found (submit_button=missing)")
+        return {"url": value.get("url"),
+                "bubbles": value.get("bubbles"),
+                "studied": value.get("studied"),
+                "prose_count": value.get("proseCount"),
+                "submit_button": value.get("submit_button"),
+                "stop_button": value.get("stop_button"),
+                "action_icon": value.get("action_icon"),
+                "model": value.get("model"),
+                "composer_len": len(str(value.get("composer") or ""))}, True, notes
+    if name == "prose":
+        if not isinstance(value, dict):
+            return {"payload": value}, None, ["payload is not an object"]
+        found = bool(value.get("found"))
+        text = str(value.get("text") or "")
+        notes = ["found but text is empty"] if found and not text.strip() else []
+        return {"found": found, "text_len": len(text)}, found, notes
+    if name == "sources":
+        if not isinstance(value, list):
+            return {"payload": value}, False, ["payload is not a list"]
+        return {"count": len(value)}, True, []
+    if name == "model_btn":
+        if not isinstance(value, dict):
+            return {"payload": value}, None, ["payload is not an object"]
+        found = bool(value.get("found"))
+        return {"found": found, "label": value.get("label"),
+                "expanded": value.get("expanded")}, found, []
+    if name == "visibility":
+        if not isinstance(value, dict) or "visible" not in value:
+            return {"payload": value}, None, ["payload has no `visible` field"]
+        notes = ([] if value.get("visible") else
+                 ["tab is hidden — trusted clicks would be silently dropped"])
+        return {"visible": bool(value.get("visible")),
+                "visibilityState": value.get("visibilityState")}, True, notes
+    if name == "model_menu":
+        if not isinstance(value, dict) or "open" not in value:
+            return {"payload": value}, None, ["payload has no `open` field"]
+        rows = value.get("rows") or []
+        notes = ["menu reports open with zero rows"] if value.get("open") and not rows else []
+        return {"open": bool(value.get("open")), "rows": len(rows)}, True, notes
+    if name == "chips":
+        if not isinstance(value, dict):
+            return {"payload": value}, None, ["payload is not an object"]
+        attachments = value.get("attachments")
+        if not isinstance(attachments, list):
+            return {"payload": value}, False, ["attachments is not a list"]
+        return {"count": len(attachments), "attachments": attachments}, True, []
+    return {"value": value}, None, []
+
+
+def console_drift(driver: Any = None, *, config: Optional[Config] = None) -> dict:
+    """Read-only drift report over the 12 `_JS_*` probes.
+
+    Every read-safe probe is executed exactly once (``mutating=False``) and
+    summarised; the action-class probes are NEVER executed (a selfcheck must
+    not click, type or inject) — they get a static source check instead: are
+    the selectors/labels they were written against still there?
+
+    Strictly read-only: no clicks, no input, no navigation, no state writes.
+
+    Returns a structured dict: ``probes`` (per-probe mode/executed/found and
+    key fields), ``missing_found`` (probes whose target was absent),
+    ``anomalies`` (anchors that drifted from their expected shape) and
+    ``counts``. ``ok`` is False when anything anomalous was found.
+    """
+    if driver is None:
+        state = load_state()
+        driver = _make_driver(config or get_config(), state)
+    locale = _probe_locale()
+    probes: dict = {}
+    anomalies: list = []
+    missing: list = []
+    for name, mode in DRIFT_PROBES:
+        entry: dict = {"mode": mode}
+        if mode == "action":
+            markers = _drift_markers(name, locale)
+            absent = [m for m in markers if m not in _drift_source(name)]
+            entry.update({"executed": False,
+                          "reason": DRIFT_STATIC_REASONS.get(name, "action probe"),
+                          "found": _drift_static_found(name, probes),
+                          "markers": list(markers),
+                          "markers_ok": not absent})
+            if absent:
+                anomalies.append(f"{name}: probe source lost marker(s) {absent}")
+        else:
+            try:
+                value = _js(driver, _drift_source(name), None, mutating=False)
+            except Exception as exc:  # noqa: BLE001 — one dead probe must not abort the report
+                entry.update({"executed": False, "found": None,
+                              "error": f"{type(exc).__name__}: {exc}"})
+                anomalies.append(f"{name}: probe failed ({exc})")
+                probes[name] = entry
+                continue
+            summary, found, notes = _drift_summary(name, value)
+            entry.update({"executed": True, "found": found, "summary": summary})
+            anomalies.extend(f"{name}: {note}" for note in notes)
+        if entry.get("found") is False:
+            missing.append(name)
+        probes[name] = entry
+    counts = {"total": len(DRIFT_PROBES),
+              "read": sum(1 for _, m in DRIFT_PROBES if m == "read"),
+              "action": sum(1 for _, m in DRIFT_PROBES if m == "action"),
+              "executed": sum(1 for e in probes.values() if e.get("executed")),
+              "found_false": len(missing),
+              "anomalies": len(anomalies)}
+    return {"ok": not anomalies, "kind": "drift", "locale": locale,
+            "probes": probes, "missing_found": missing, "anomalies": anomalies,
+            "counts": counts}
 
 
 def console_selfcheck(*, wait_budget: float = DEFAULT_WAIT,

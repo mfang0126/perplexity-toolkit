@@ -58,3 +58,29 @@ class TestUiStrings:
         zh_keys = set(UI_STRINGS["zh"].keys())
         en_keys = set(UI_STRINGS["en"].keys())
         assert zh_keys == en_keys
+
+
+class TestConsoleProbeLabels:
+    """The three labels console.py matches on (studied pill / expand / chip prefix)."""
+
+    def test_key_exists_in_both_locales(self):
+        for key in ("studied", "expand", "remove_prefix"):
+            assert key in UI_STRINGS["zh"]
+            assert key in UI_STRINGS["en"]
+
+    def test_studied_zh_en(self):
+        assert get_ui_string("studied", "zh") == "已研究"
+        # en value is a completion-form label matching 「已研究」; not live-verified
+        assert get_ui_string("studied", "en") == "Researched"
+
+    def test_expand_zh_en(self):
+        assert get_ui_string("expand", "zh") == "展开"
+        assert get_ui_string("expand", "en") == "Expand"
+
+    def test_remove_prefix_zh_en(self):
+        assert get_ui_string("remove_prefix", "zh") == "移除 "
+        assert get_ui_string("remove_prefix", "en") == "Remove "
+
+    def test_legacy_expand_label_is_the_existing_show_more(self):
+        assert get_ui_string("show_more", "zh") == "查看更多"
+        assert get_ui_string("show_more", "en") == "Show more"

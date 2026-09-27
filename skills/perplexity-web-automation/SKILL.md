@@ -197,6 +197,7 @@ perplexity console ask "query" [--task NAME] [--new-thread] [-f json] \
 perplexity console status                                              # state + live readback
 perplexity console threads                                             # recorded task threads
 perplexity console selfcheck                                           # canned full-gate run
+perplexity console selfcheck --drift | console drift                   # read-only probe drift report (12 probes, never clicks/types)
 perplexity console extract [--peek] [--again] [--strict]               # re-read without consuming / strict
 ```
 
@@ -215,7 +216,7 @@ perplexity console attach --file F | files | detach NAME         # attachment ma
 Recovery cookbook by error code (all commands print `error_code` in JSON):
 - `pending.missing` → nothing staged: run `fill` first. `pending.stale` (>30 min) → re-`fill`. `pending.page-moved` → tab wandered: `console open <task>` then re-`fill`; page-moved now auto-reattaches once per step (but NEVER replays submit — checked at the step level). `pending.not-submitted` → `wait` needs `submit` first.
 - `fill.not-committed` → editor desynced; the step already tried one reload — re-run `fill` once, then read the evidence screenshot.
-- `submit.no-turn` → check the error's last-bubble hint; if a mis-sent turn exists, `console open` (reload) then re-`fill`/`submit`.
+- `submit.no-turn` → check the error's last-bubble hint; if a mis-sent turn exists, `console open` (reload) then re-`fill`/`submit`. The error's `gates.submit.no_progress` says per rung (`button`/`combo`) which wait tripped the breaker vs. timed out — `act.no-progress` is only raised when EVERY wait tripped. `act.no-progress` → the no-progress circuit breaker: 3 consecutive polls with a byte-identical substantive signal (URL / bubbles / prose / controls; rect jitter ignored) — the wait failed fast instead of idling out the timeout. Nothing on the page moved: check the tab (hidden tab, dead composer, extension down) before re-firing the action. Exception: the attachment-chip wait gets a 5s slow-page grace (`guard_min_elapsed`) before the streak counts, so slow uploads are not cut off at ~3 polls.
 - `complete.timeout` → answer didn't settle in budget: `wait --wait <bigger>` (deep answers run minutes) or `extract` what's there.
 - `bridge.probe-failed` → WebBridge gave 5 consecutive empty probes (e.g. 502 outage): retry the whole step.
 - `model.tab-hidden` → the console tab is hidden/occluded and trusted clicks would be silently dropped; bring the Chrome tab to the front and retry (`Page.bringToFront` was already attempted). `model.menu-failed` → the menu portal did not open even on a visible tab — retry once, then inspect the model button readback.
@@ -269,9 +270,9 @@ Model selector & attachments (added 2026-09-21):
 | Answer tab | `[role=tab]` with text "答案" | Default active |
 | Links tab | `[role=tab]` with text "链接" | Shows sources |
 | Images tab | `[role=tab]` with text "图片" | Image results |
-| Expand answer | `button` with text "查看更多" | Collapsed by default! |
+| Expand answer | `button` with text "展开" (new UI) or 「查看更多」 (legacy) | Collapsed by default! `_JS_EXPAND` matches both labels EXACTLY first; only when no exact match exists does it fall back to `includes`, and then only for buttons whose text is essentially just the label (≤2 chars of icon/punctuation noise) — a follow-up question like 「怎么查看更多细节？」 is never clicked |
 | Source count | `button` with text "N 个来源" | Inline badge |
-| Follow-up Qs | `button` with question text | Below answer |
+| Follow-up Qs | `button` with question text | Below answer — never treated as the expand control |
 
 ## Python Helper Script
 
