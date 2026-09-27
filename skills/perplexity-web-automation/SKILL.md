@@ -308,3 +308,7 @@ The CDP `Input.insertText` fallback (used when `fill` fails) applies to the **in
 - Do not close the session automatically. Per `kimi-webbridge`, `close_session` is user-initiated only (for example, the user explicitly asks to close or clear the tabs); never `close_session` the purpose console as cleanup — use `close_tab`.
 - If the extension says it is already linked, inspect `list_tabs` and continue with the existing daemon/session instead of creating a new thread/session.
 - Tabs accumulate in the session's group only when deliberately opened with `newTab:true`; keep the group within the hygiene purpose quota (target 1–3, ceiling 5) and readable.
+
+## Local review notes
+
+Machine-local audit trail (referenced by name, not part of this repo): the Obsidian project **Perplexity Robustness Review** (`Projects/perplexity-robustness-review/`) holds the DOM fragility audit of this skill's probes, the hardening decision log, the jev-ultrafast structural comparison, and the A/B iteration protocol. Consult it before changing selectors/probes; record probe-drift findings there.
