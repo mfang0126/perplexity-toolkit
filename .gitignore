@@ -12,3 +12,4 @@ batch_results.json
 .DS_Store
 *.egg-info/
 __pycache__/
+uv.lock
