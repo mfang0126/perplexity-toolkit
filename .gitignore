@@ -13,3 +13,7 @@ batch_results.json
 *.egg-info/
 __pycache__/
 uv.lock
+
+# Added by ggshield
+.cache_ggshield
+.cache_ggshield
