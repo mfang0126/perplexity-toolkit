@@ -47,7 +47,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from . import console_judge
 from .config import Config, get_config
@@ -460,6 +460,113 @@ _JS_BOUND_TMPL = r"""/*PPLX_BOUND_PROBE*/(() => {
   }
   return JSON.stringify(out);
 })()"""
+
+# Pre-action geometry/occlusion re-check (融合项 d, narrow): before a
+# click/fill fires on cached coordinates or a selector target, the action
+# point is re-verified ONCE more against the live DOM:
+#
+#   (a) the target rect must be non-degenerate (w/h ≥ 1) and sit inside the
+#       viewport — a rect whose centre leaves the viewport is unusable;
+#   (b) `document.elementFromPoint(cx, cy)` at the target's CENTRE must hit
+#       the target itself or an element inside its subtree; the target being
+#       an ANCESTOR of the hit (point lands on a container) also counts.
+#       A floating layer/弹窗 covering the target makes elementFromPoint
+#       return the LAYER (rel 'other') → unusable.
+#
+# Input spec (JSON-injected, `__SPEC__`): {"selector": css} | {"selectors":
+# [css, …]} (first match wins, mirroring `_JS_CLICK_SUBMIT`) | {"rect":
+# {x, y, w, h}} (cached coordinates; the target is re-identified by a
+# matching rect near the hit — hit's ancestor-or-self chain or subtree).
+# Read-only: no click, no input, no scroll. Returns JSON like the other
+# probes: {ok, reason, rel, target, hit}; `reason` is '' on success and one
+# of not-found / no-spec / not-visible / degenerate / off-viewport / no-hit /
+# occluded otherwise. The /*PPLX_HITTEST_PROBE*/ marker lets test doubles
+# dispatch on an unambiguous signature (same convention as the rung-2
+# probes); it sits INSIDE the IIFE body — not as the source prefix — so the
+# rung-2 bookkeeping (`pplx_probes`, sources starting with `/*PPLX_`) keeps
+# meaning "element-table rung probes only": this gate is a different class.
+# The spec is injected with ``ensure_ascii=True`` so UI-label
+# literals (submit selectors) never appear verbatim in the executed source.
+_JS_HITTEST_TMPL = r"""(() => {
+  /*PPLX_HITTEST_PROBE*/
+  const spec = __SPEC__;
+  const out = {ok: false, reason: '', rel: '', target: null, hit: null};
+  const desc = (el) => {
+    if (!el || !el.tagName) return null;
+    return {tag: String(el.tagName).toLowerCase(),
+            role: (el.getAttribute && el.getAttribute('role')) || '',
+            label: (el.getAttribute && el.getAttribute('aria-label')) || '',
+            text: String(el.innerText || el.textContent || '').trim().slice(0, 120)};
+  };
+  const vis = (el) => {
+    try { return el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null; }
+    catch (e) { return true; }
+  };
+  const boxOf = (r) => ({x: Number(r.x) || 0, y: Number(r.y) || 0,
+    w: Number(r.width !== undefined ? r.width : r.w) || 0,
+    h: Number(r.height !== undefined ? r.height : r.h) || 0});
+  const box = (el) => boxOf(el.getBoundingClientRect());
+  let target = null, rect = null;
+  const sel = String(spec.selector || '');
+  const sels = (spec.selectors && spec.selectors.length) ? spec.selectors
+             : (sel ? [sel] : []);
+  if (sels.length) {
+    for (const s of sels) {
+      const el = document.querySelector(String(s));
+      if (el) { target = el; break; }
+    }
+    if (!target) { out.reason = 'not-found'; return JSON.stringify(out); }
+    rect = box(target);
+    out.target = desc(target);
+    if (!vis(target)) { out.reason = 'not-visible'; return JSON.stringify(out); }
+  } else if (spec.rect) {
+    rect = boxOf(spec.rect);
+  } else {
+    out.reason = 'no-spec'; return JSON.stringify(out); }
+  const vw = Number(window.innerWidth) || 0, vh = Number(window.innerHeight) || 0;
+  if (!(rect.w >= 1) || !(rect.h >= 1)) {
+    out.reason = 'degenerate'; return JSON.stringify(out); }
+  if (rect.x + rect.w <= 0 || rect.y + rect.h <= 0 || rect.x >= vw || rect.y >= vh) {
+    out.reason = 'off-viewport'; return JSON.stringify(out); }
+  const cx = Math.trunc(rect.x) + Math.trunc(rect.w / 2), cy = Math.trunc(rect.y) + Math.trunc(rect.h / 2);
+  if (cx < 0 || cy < 0 || cx >= vw || cy >= vh) {
+    out.reason = 'off-viewport'; return JSON.stringify(out); }
+  const hit = document.elementFromPoint(cx, cy);
+  if (!hit) { out.reason = 'no-hit'; return JSON.stringify(out); }
+  out.hit = desc(hit);
+  const relOf = (el) => (el === hit) ? 'self'
+    : (el.contains(hit) ? 'descendant'
+    : (hit.contains(el) ? 'ancestor' : 'other'));
+  if (target) {
+    out.rel = relOf(target);
+    if (out.rel === 'other') { out.reason = 'occluded'; return JSON.stringify(out); }
+    out.ok = true;
+    return JSON.stringify(out);
+  }
+  // rect mode: the cached target is re-identified by its rect (±2px) among
+  // the hit's ancestor-or-self chain and subtree; no match ⇒ the point no
+  // longer lands in the candidate's subtree (occluded / moved) ⇒ unusable.
+  const tol = 2;
+  const same = (a, b) => Math.abs(a.x - b.x) <= tol && Math.abs(a.y - b.y) <= tol
+    && Math.abs(a.w - b.w) <= tol && Math.abs(a.h - b.h) <= tol;
+  let all = [];
+  try { all = Array.from(document.querySelectorAll('*')); } catch (e) { all = []; }
+  for (const el of all) {
+    if (!el || !el.tagName || typeof el.getBoundingClientRect !== 'function') continue;
+    let r = null;
+    try { r = box(el); } catch (e) { continue; }
+    if (!same(r, rect)) continue;
+    out.target = desc(el);
+    out.rel = relOf(el);
+    if (out.rel !== 'other') { out.ok = true; return JSON.stringify(out); }
+  }
+  out.reason = 'occluded';
+  out.rel = 'other';
+  return JSON.stringify(out);
+})()"""
+
+# Import-time binding kept for introspection (same convention as `_JS_INFO`).
+_JS_HITTEST = _JS_HITTEST_TMPL
 
 # ──────────────────────────────────────────────────────────────
 # Locale-aware probe assembly
@@ -1005,6 +1112,78 @@ def _press_escape(driver: Any, *, sleep: Callable[[float], None]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# Pre-action geometry/occlusion gate (融合项 d, narrow)
+# ──────────────────────────────────────────────────────────────
+
+_SUBMIT_SELECTORS = ('button[aria-label="提交"]',
+                     'button[aria-label="搜索"]',
+                     'button[aria-label="Submit"]')
+
+
+def _action_point_ok(driver: Any, *, selector: Optional[str] = None,
+                     selectors: Optional[Sequence[str]] = None,
+                     rect: Optional[dict] = None) -> Optional[dict]:
+    """Pre-action geometry/occlusion re-check via the read-only hit-test probe.
+
+    Returns ``None`` when the action point is usable (target visible, inside
+    the viewport, and the centre hit lands in the target's own subtree) and a
+    reason dict ``{"reason", "rel", "summary"}`` when it is NOT — the caller
+    must then fail closed (``act.target-occluded``) instead of firing the
+    action blind. ``summary`` is the occluder/target
+    ``tag/role/aria-label/text-head`` snapshot, sanitized (URL query strings
+    and suspected tokens stripped) and ≤80 chars.
+
+    A probe that is not operational (bridge returned nothing parseable) or a
+    target that simply is not there (``not-found``) yields ``None``: those
+    cases carry no occlusion verdict and keep the historical failure
+    semantics of the calling rung (the codebase's `unavailable` convention).
+    """
+    if selectors:
+        spec: dict = {"selectors": [str(s) for s in selectors]}
+    elif selector:
+        spec = {"selector": str(selector)}
+    elif rect is not None:
+        spec = {"rect": {k: v for k, v in dict(rect).items()
+                         if k in ("x", "y", "w", "h", "width", "height")}}
+    else:
+        return {"reason": "no-spec", "rel": "", "summary": ""}
+    code = _JS_HITTEST.replace("__SPEC__", json.dumps(spec, ensure_ascii=True))
+    payload = _js(driver, code, None, mutating=False)
+    if not isinstance(payload, dict) or "ok" not in payload:
+        return None                       # probe not operational: no verdict
+    if payload.get("ok"):
+        return None
+    reason = str(payload.get("reason") or "unusable")
+    if reason == "not-found":
+        return None      # nothing to act on: the rung's own semantics decide
+    raw_hit = payload.get("hit")
+    raw_target = payload.get("target")
+    hit = raw_hit if isinstance(raw_hit, dict) else {}
+    target = raw_target if isinstance(raw_target, dict) else {}
+    src = hit or target
+    summary = _snapshot_summary(role=src.get("role") or src.get("tag") or "",
+                                label=src.get("label") or "",
+                                text=str(src.get("text") or ""))
+    return {"reason": reason, "rel": str(payload.get("rel") or ""),
+            "summary": summary}
+
+
+def _target_occluded_error(gate: str, what: str, blocked: dict,
+                           driver: Any = None) -> ConsoleError:
+    """Fail-closed error for a blocked action point (never a blind click)."""
+    summary = str(blocked.get("summary") or "")
+    return ConsoleError(
+        gate,
+        f"{what} 未通过执行前几何/遮挡复检（{blocked.get('reason')}"
+        f"{'，遮挡者: ' + summary if summary else ''}）—— 动作未发出"
+        f" / pre-action hit-test blocked the {what} "
+        f"({blocked.get('reason')}); the action was NOT fired (fail-closed)",
+        gates={gate: {"ok": False, "target": dict(blocked)}},
+        evidence=_evidence(driver) if driver is not None else None,
+        code="act.target-occluded")
+
+
+# ──────────────────────────────────────────────────────────────
 # Fallback rungs (probe → element-table rung → probe.fallback-exhausted)
 #
 # Each rung follows D1=A: the deterministic heuristic below only proposes
@@ -1424,6 +1603,17 @@ def _expand_fallback_rung(driver: Any, *,
         rect = cand.get("rect") or {}
         cx = int(rect.get("x") or 0) + int(rect.get("w") or 0) // 2
         cy = int(rect.get("y") or 0) + int(rect.get("h") or 0) // 2
+        # 融合项 d: a cached-coordinate click re-verifies its point first —
+        # when the point no longer lands inside the candidate's subtree
+        # (浮层覆盖 / layout drift) the click is NOT fired; the candidate
+        # counts as a failed attempt and the rung moves to the next one.
+        blocked = _action_point_ok(driver, rect=rect)
+        if blocked is not None:
+            attempts.append({"i": cand.get("i"), "summary": summary,
+                             "readback_ok": True, "hit_ok": False,
+                             "why": blocked.get("reason"),
+                             "occluder": blocked.get("summary", "")})
+            continue
         # RC4: the sample carries the candidate identity (index + click
         # coords, in a key geometry-stripping keeps) so N sibling buttons
         # with the same text are N different actions — only a REPEATED
@@ -1568,6 +1758,12 @@ def _gate_fill(driver: Any, query: str, *, sleep: Callable[[float], None],
     state empty even if the DOM shows text), so both must agree.
     """
     qn = _normalize(query)
+    # 融合项 d (fill 路径): the composer click+fill is a gated action — the
+    # target must be visible and un-occluded before either call fires
+    # (fail-closed: act.target-occluded, never type blind under a 浮层).
+    blocked = _action_point_ok(driver, selector="[contenteditable]")
+    if blocked is not None:
+        raise _target_occluded_error("fill", "composer click+fill", blocked, driver)
     detail: dict = {"composer_before": _composer(driver), "tries": []}
     for attempt in range(1, attempts + 1):
         driver.click("[contenteditable]")
@@ -1698,11 +1894,21 @@ def _gate_submit(driver: Any, query: str, base_bubbles: int, *,
     else:
         actions.append({"action": "composer-refresh", "result": "ok"})
 
+    # 融合项 d (submit 路径): the submit-button click is gated the same way —
+    # covered/off-viewport target ⇒ act.target-occluded, fail-closed, never a
+    # blind click (the selector list mirrors `_JS_CLICK_SUBMIT`'s own order).
+    blocked = _action_point_ok(driver, selectors=_SUBMIT_SELECTORS)
+    if blocked is not None:
+        raise _target_occluded_error("submit", "submit-button click", blocked, driver)
     clicked = _js(driver, _JS_CLICK_SUBMIT, "no-button")
     actions.append({"action": "click-submit-button", "result": clicked})
     if "clicked" not in str(clicked):
         # UI transition gaps can transiently unmount the button: retry once
         sleep(0.8)
+        blocked = _action_point_ok(driver, selectors=_SUBMIT_SELECTORS)
+        if blocked is not None:
+            raise _target_occluded_error("submit", "submit-button click (retry)",
+                                         blocked, driver)
         retry = _js(driver, _JS_CLICK_SUBMIT, "no-button")
         actions.append({"action": "click-submit-button-retry", "result": retry})
         clicked = retry
@@ -2247,6 +2453,10 @@ def _stage_fill(drv: Any, state: dict, cfg: Config, query: str, *,
     except ConsoleError as fill_exc:
         if fill_exc.gate != "fill":
             raise
+        if fill_exc.code == "act.target-occluded":
+            # 融合项 d: occlusion is environmental — fail-closed as-is; the
+            # desync reload self-heal below is for fill.not-committed only.
+            raise
         # Bounded self-heal: a desynced editor (DOM shows text, React state
         # empty) is reset by one page reload; the gate is then retried once.
         logger.warning("fill gate failed (%s); reloading page once and retrying",
@@ -2315,10 +2525,12 @@ def _submit_with_recovery(drv: Any, cfg: Config, query: str, base_bubbles: int, 
     except ConsoleError as submit_exc:
         if submit_exc.gate != "submit":
             raise
-        if submit_exc.code == "probe.fallback-exhausted":
+        if submit_exc.code in ("probe.fallback-exhausted", "act.target-occluded"):
             # WARN red line: without an independent identity binding the
             # ownership claim can never be recovered by reloading/re-sending —
             # stop here (fail-closed), never retry a send on missing evidence.
+            # Same for act.target-occluded (融合项 d): a covered/off-viewport
+            # target is never blind-clicked and never auto-resubmitted.
             raise
         # First, give a slow/duplicated ownership read one more chance so a
         # late-but-correct turn never gets sent twice. A breaker trip here

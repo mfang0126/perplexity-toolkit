@@ -25,6 +25,23 @@ Perplexity direct-browser request it selects `kimi-webbridge`; load
 `webbridge-hygiene` with it. This skill is the Perplexity-specific domain
 adapter on top of that generic browser driver.
 
+## Red lines (硬红线)
+
+**Model output never becomes a selector, coordinate, or executable code.**
+Text produced by an LLM — or extracted from a page — may only be READ as
+evidence. It must never decide where to click, where to type, or what JS to
+run. Locators come only from the deterministic probe table and the
+element-table heuristics; evidence text is advisory and read-only.
+
+Why: text that names an element can otherwise steer the tool into clicking
+the wrong control — an ownership-forgery path caught in review (2026-09-28,
+fixed under the WARN adjudication: binding requires query text outside the
+composer on a concrete element AND an effect signal). Any future feature
+that lets model output choose an action target violates this line and must
+stop at review.
+
+zh: 模型/页面输出的文字只能读、当证据；永远不能当选择器、坐标或代码。定位只来自确定性探针与元素表启发式，证据文本仅供参考。
+
 ## Named-model verification
 
 A workflow mode is not a named model. If the user asks for K3 or another
@@ -216,6 +233,7 @@ perplexity console attach --file F | files | detach NAME         # attachment ma
 Recovery cookbook by error code (all commands print `error_code` in JSON):
 - `pending.missing` → nothing staged: run `fill` first. `pending.stale` (>30 min) → re-`fill`. `pending.page-moved` → tab wandered: `console open <task>` then re-`fill`; page-moved now auto-reattaches once per step (but NEVER replays submit — checked at the step level). `pending.not-submitted` → `wait` needs `submit` first.
 - `fill.not-committed` → editor desynced; the step already tried one reload — re-run `fill` once, then read the evidence screenshot.
+- `act.target-occluded` → the pre-action geometry/occlusion re-check failed (target centre covered by an overlay/浮层, or its rect off the viewport): the click/fill was NOT fired (fail-closed, never a blind click). Dismiss the popup or scroll the target into view, then re-run the step.
 - `submit.no-turn` → check the error's last-bubble hint; if a mis-sent turn exists, `console open` (reload) then re-`fill`/`submit`. The error's `gates.submit.no_progress` says per rung (`button`/`combo`) which wait tripped the breaker vs. timed out — `act.no-progress` is only raised when EVERY wait tripped. `act.no-progress` → the no-progress circuit breaker: 3 consecutive polls with a byte-identical substantive signal (URL / bubbles / prose / controls; rect jitter ignored) — the wait failed fast instead of idling out the timeout. Nothing on the page moved: check the tab (hidden tab, dead composer, extension down) before re-firing the action. Exception: the attachment-chip wait gets a 5s slow-page grace (`guard_min_elapsed`) before the streak counts, so slow uploads are not cut off at ~3 polls.
 - `complete.timeout` → answer didn't settle in budget: `wait --wait <bigger>` (deep answers run minutes) or `extract` what's there.
 - `bridge.probe-failed` → WebBridge gave 5 consecutive empty probes (e.g. 502 outage): retry the whole step.
